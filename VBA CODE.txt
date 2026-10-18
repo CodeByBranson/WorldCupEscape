@@ -1,0 +1,6792 @@
+Option Explicit
+
+'=========================================================
+' WORLD CUP ESCAPE
+' Excel VBA Maze Game
+'=========================================================
+
+Private Const SHEET_NAME As String = "Maze"
+
+Private Const MAZE_TOP As Long = 4
+Private Const MAZE_LEFT As Long = 2
+
+Private Const MAX_MAZE_SIZE As Long = 23
+
+'=========================================================
+' AUDIO ENGINE - WINDOWS API
+'
+' All music and sound effects are generated as real WAV
+' files and played through Windows MCI (winmm.dll), which
+' works reliably on any machine with a sound device.
+' No external audio files or references are needed.
+'=========================================================
+
+#If VBA7 Then
+    Private Declare PtrSafe Function mciSendStringW Lib "winmm.dll" ( _
+        ByVal lpstrCommand As LongPtr, _
+        ByVal lpstrReturnString As LongPtr, _
+        ByVal uReturnLength As Long, _
+        ByVal hwndCallback As LongPtr) As Long
+
+    Private Declare PtrSafe Function SetTimer Lib "user32" ( _
+        ByVal hWnd As LongPtr, _
+        ByVal nIDEvent As LongPtr, _
+        ByVal uElapse As Long, _
+        ByVal lpTimerFunc As LongPtr) As LongPtr
+
+    Private Declare PtrSafe Function KillTimer Lib "user32" ( _
+        ByVal hWnd As LongPtr, _
+        ByVal nIDEvent As LongPtr) As Long
+
+    Private hMusicTimer As LongPtr
+    Private Const MUSIC_TIMER_ID As LongPtr = 4321
+#Else
+    Private Declare Function mciSendStringW Lib "winmm.dll" ( _
+        ByVal lpstrCommand As Long, _
+        ByVal lpstrReturnString As Long, _
+        ByVal uReturnLength As Long, _
+        ByVal hwndCallback As Long) As Long
+
+    Private Declare Function SetTimer Lib "user32" ( _
+        ByVal hWnd As Long, _
+        ByVal nIDEvent As Long, _
+        ByVal uElapse As Long, _
+        ByVal lpTimerFunc As Long) As Long
+
+    Private Declare Function KillTimer Lib "user32" ( _
+        ByVal hWnd As Long, _
+        ByVal nIDEvent As Long) As Long
+
+    Private hMusicTimer As Long
+    Private Const MUSIC_TIMER_ID As Long = 4321
+#End If
+
+Private Const MUSIC_TICK_MS As Long = 300
+
+Private audioReady As Boolean
+Private audioFolder As String
+
+Private sfxBuf() As Double
+Private sfxRate As Long
+
+'=========================================================
+' MUSIC STATE
+'
+' Three chilled football tracks are shuffled: when one
+' finishes, a random different track starts, so the music
+' stays fresh.
+'=========================================================
+
+Private musicOn As Boolean
+Private musicInitialized As Boolean
+Private musicPlaying As Boolean
+Private musicBusy As Boolean
+Private currentMusicTrack As Long
+
+'Per-track style settings (set by LoadMusicTune).
+Private musicMelody As Variant
+Private musicBass As Variant
+Private musicChords As Variant
+Private musicStepSec As Double
+Private musicNoteLen As Double
+Private musicNoteDecay As Double
+Private musicTone2Ratio As Double
+Private musicTone2Amp As Double
+Private musicBassSteps As String
+Private musicBassDecay As Double
+Private musicPadAttack As Double
+Private musicKickSteps As String
+Private musicShakerSteps As String
+Private musicCrowdAmp As Double
+
+'=========================================================
+' GAME VARIABLES
+'=========================================================
+
+Private currentLevel As Long
+Private currentMazeSize As Long
+
+Private playerRow As Long
+Private playerCol As Long
+
+Private startRow As Long
+Private startCol As Long
+
+Private score As Long
+Private goalsCollected As Long
+
+'=========================================================
+' LEVEL CHECKPOINT
+'=========================================================
+
+Private levelStartScore As Long
+Private levelStartGoals As Long
+
+Private lives As Long
+
+Private gameRunning As Boolean
+Private gamePaused As Boolean
+
+'=========================================================
+' LIFE LOSS POINT PENALTIES
+'=========================================================
+
+Private Const LIFE_LOSS_LEVEL_1 As Long = 5
+Private Const LIFE_LOSS_LEVEL_2 As Long = 10
+Private Const LIFE_LOSS_LEVEL_3 As Long = 15
+Private Const LIFE_LOSS_LEVEL_4 As Long = 20
+Private Const LIFE_LOSS_LEVEL_5 As Long = 25
+
+'=========================================================
+' TIMER VARIABLES
+'=========================================================
+
+Private gameStart As Date
+Private pauseStarted As Date
+
+Private totalPausedSeconds As Double
+
+Private levelStartElapsedSeconds As Long
+Private Const LEVEL_TIME_LIMIT As Long = 90
+
+Private nextTick As Date
+Private nextTickScheduled As Boolean
+
+'=========================================================
+' MAZE DATA
+'
+' # = Defender / Wall
+' . = Football Pitch
+' G = Goal
+' X = Trap
+' E = World Cup Trophy / Exit
+'=========================================================
+
+Private mazeData(0 To 22, 0 To 22) As String
+
+Private solutionPath(0 To 22, 0 To 22) As Boolean
+
+Private selectedTeam As String
+Private selectedTeamFlag As String
+Private teamSelectionMade As Boolean
+
+'=========================================================
+' SPEED: remembers which stage the static dashboard
+' cells were last written for, so they are only
+' rewritten when the stage actually changes.
+'=========================================================
+
+Private lastStageKey As String
+
+'=========================================================
+' START NEW TOURNAMENT
+'=========================================================
+
+Public Sub StartGame()
+
+    CancelTimer
+
+    UnbindArrowKeys
+
+    gameRunning = False
+    gamePaused = False
+
+    Randomize
+
+    'The chilled stadium music is on by default and each
+    'new game starts with a random track (shuffle).
+    If musicInitialized = False Then
+        musicOn = True
+        musicInitialized = True
+    End If
+
+    currentMusicTrack = Int(Rnd * 3) + 1
+
+    'Music plays from the team selection screen onwards.
+    StartMusic
+
+    '=====================================================
+    ' SPEED: the selection screen and the level are built
+    ' while the screen is hidden and shown in one repaint.
+    '=====================================================
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+
+    If SelectTeam() = False Then
+
+        StopMusic
+        CloseSound
+
+        Application.Calculation = xlCalculationAutomatic
+        Application.EnableEvents = True
+        Application.ScreenUpdating = True
+
+        Exit Sub
+
+    End If
+
+    'SelectTeam re-enables the screen so the flags can be
+    'clicked - hide it again for the fast level build.
+    Application.ScreenUpdating = False
+
+    currentLevel = 1
+
+    score = 0
+    goalsCollected = 0
+
+    levelStartScore = 0
+    levelStartGoals = 0
+
+    gameRunning = True
+    gamePaused = False
+
+    totalPausedSeconds = 0
+    gameStart = Now
+
+    'Force the static dashboard cells to be rewritten.
+    lastStageKey = ""
+
+    'SPEED: the dashboard itself is built inside StartLevel
+    'while the screen is hidden, so it is only created once.
+    SetupHighScores
+
+    BindArrowKeys
+
+    StartLevel
+
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+
+End Sub
+
+
+Private Function SelectTeam() As Boolean
+
+    Dim ws As Worksheet
+    Dim teams As Variant
+    Dim i As Long
+    Dim shapeIndex As Long
+    Dim shp As Shape
+    Dim startLeft As Double
+    Dim startTop As Double
+    Dim flagWidth As Double
+    Dim flagHeight As Double
+    Dim gapX As Double
+    Dim gapY As Double
+    Dim colIndex As Long
+    Dim rowIndex As Long
+
+    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
+
+    teams = Array( _
+        "Algeria", "Argentina", "Australia", "Austria", _
+        "Belgium", "Bosnia and Herzegovina", "Brazil", "Cabo Verde", _
+        "Canada", "Colombia", "Congo DR", "Croatia", _
+        "Curaçao", "Czechia", "Ecuador", "Egypt", _
+        "England", "France", "Germany", "Ghana", _
+        "Haiti", "IR Iran", "Iraq", "Japan", _
+        "Jordan", "Korea Republic", "Mexico", "Morocco", _
+        "Netherlands", "New Zealand", "Norway", "Panama", _
+        "Paraguay", "Portugal", "Qatar", "Saudi Arabia", _
+        "Scotland", "Senegal", "South Africa", "Spain", _
+        "Sweden", "Switzerland", "Tunisia", "Türkiye", _
+        "USA", "Uruguay", "Uzbekistan", "Côte d'Ivoire")
+
+    teamSelectionMade = False
+    selectedTeam = ""
+    selectedTeamFlag = ""
+
+    '=====================================================
+    ' SPEED: build the entire selection screen while the
+    ' screen is hidden and show it in one repaint.
+    '=====================================================
+    Application.ScreenUpdating = False
+
+    On Error Resume Next
+
+    ws.Range("B1:X2").UnMerge
+    ws.Range("B3:X3").UnMerge
+
+    For Each shp In ws.Shapes
+
+        If Left$(shp.Name, 8) = "WCFlag__" _
+            Or Left$(shp.Name, 14) = "WCFlagVisual__" _
+            Or Left$(shp.Name, 14) = "WCTrophyAnim__" Then
+            shp.Delete
+        End If
+
+    Next shp
+
+    On Error GoTo 0
+
+    'Cleared down to row 40 so no part of a finished
+    'level 5 maze (which reaches row 26) is left behind.
+    ws.Range("B1:X40").Clear
+
+    'World Cup stadium background for the selection screen.
+    PaintStadiumBackground ws
+
+    'Keep the high score table styled correctly.
+    RestoreHighScoreFills ws
+
+    With ws.Range("B1:X2")
+
+        .Merge
+
+        .value = WorldCupSymbol("TROPHY") & _
+            "  SELECT YOUR TEAM  " & _
+            WorldCupSymbol("TROPHY")
+
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+
+        .Font.Name = "Segoe UI Emoji"
+        .Font.Bold = True
+        .Font.Size = 24
+
+        .Font.Color = RGB(255, 215, 0)
+
+        .Interior.Color = RGB(15, 35, 60)
+
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(255, 215, 0)
+        .Borders.Weight = xlMedium
+
+    End With
+
+    With ws.Range("B3:X3")
+
+        .Merge
+
+        .value = "CLICK A FLAG TO REPRESENT YOUR COUNTRY"
+
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+
+        .Font.Bold = True
+        .Font.Size = 12
+
+        .Font.Color = RGB(255, 255, 255)
+
+        .Interior.Color = RGB(35, 75, 55)
+
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(255, 255, 255)
+
+    End With
+
+    '48 flags arranged in the same compact 8 x 6 grid.
+    startLeft = ws.Range("B5").Left
+    startTop = ws.Range("B5").top
+
+    flagWidth = 52
+    flagHeight = 34
+    gapX = 58
+    gapY = 39
+
+    For i = LBound(teams) To UBound(teams)
+
+        colIndex = i Mod 8
+        rowIndex = i \ 8
+
+        shapeIndex = i + 1
+
+        'Draw the actual flag graphic.
+        DrawTeamFlagGraphic _
+            ws, _
+            i, _
+            startLeft + (colIndex * gapX), _
+            startTop + (rowIndex * gapY), _
+            flagWidth, _
+            flagHeight, _
+            "WCFlagVisual__" & Format$(shapeIndex, "00")
+
+        'Transparent click target over the flag.
+        Set shp = ws.Shapes.AddShape( _
+            msoShapeRectangle, _
+            startLeft + (colIndex * gapX), _
+            startTop + (rowIndex * gapY), _
+            flagWidth, _
+            flagHeight)
+
+        shp.Name = "WCFlag__" & Format$(shapeIndex, "00")
+
+        shp.Fill.Transparency = 1
+        shp.Line.Transparency = 1
+
+        shp.AlternativeText = teams(i)
+        shp.OnAction = "'" & ThisWorkbook.Name & "'!SelectTeamByFlag"
+
+    Next i
+
+    'Show the finished selection screen.
+    Application.ScreenUpdating = True
+
+    Do While teamSelectionMade = False
+
+        DoEvents
+
+    Loop
+
+    On Error Resume Next
+
+    For Each shp In ws.Shapes
+
+        If Left$(shp.Name, 8) = "WCFlag__" _
+            Or Left$(shp.Name, 14) = "WCFlagVisual__" _
+            Or Left$(shp.Name, 14) = "WCTrophyAnim__" Then
+            shp.Delete
+        End If
+
+    Next shp
+
+    On Error GoTo 0
+
+    SelectTeam = True
+
+End Function
+
+
+Public Sub SelectTeamByFlag()
+
+    Dim ws As Worksheet
+    Dim callerName As String
+    Dim teamNumber As Long
+    Dim teams As Variant
+
+    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
+
+    teams = Array( _
+        "Algeria", "Argentina", "Australia", "Austria", _
+        "Belgium", "Bosnia and Herzegovina", "Brazil", "Cabo Verde", _
+        "Canada", "Colombia", "Congo DR", "Croatia", _
+        "Curaçao", "Czechia", "Ecuador", "Egypt", _
+        "England", "France", "Germany", "Ghana", _
+        "Haiti", "IR Iran", "Iraq", "Japan", _
+        "Jordan", "Korea Republic", "Mexico", "Morocco", _
+        "Netherlands", "New Zealand", "Norway", "Panama", _
+        "Paraguay", "Portugal", "Qatar", "Saudi Arabia", _
+        "Scotland", "Senegal", "South Africa", "Spain", _
+        "Sweden", "Switzerland", "Tunisia", "Türkiye", _
+        "USA", "Uruguay", "Uzbekistan", "Côte d'Ivoire")
+
+    callerName = CStr(Application.Caller)
+    teamNumber = Val(Replace(callerName, "WCFlag__", ""))
+
+    If teamNumber < 1 Or teamNumber > 48 Then Exit Sub
+
+    selectedTeam = teams(teamNumber - 1)
+    selectedTeamFlag = TeamFlag(teamNumber - 1)
+
+    teamSelectionMade = True
+
+    PlayClickSound
+
+End Sub
+
+
+Private Sub DrawTeamFlagGraphic( _
+    ByVal ws As Worksheet, _
+    ByVal teamIndex As Long, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    Dim shp As Shape
+    Dim cellW As Double
+    Dim cellH As Double
+    Dim r As Long
+    Dim c As Long
+    Dim baseColor As Long
+    Dim p As String
+    Dim i As Long
+    Dim idx As Long
+    Dim x As Double
+    Dim y As Double
+
+    'Small flags are deliberately drawn from simple vector shapes so
+    'they display correctly in Excel without relying on emoji fonts.
+    cellW = flagWidth / 3
+    cellH = flagHeight / 2
+
+    'Default white flag background.
+    Set shp = ws.Shapes.AddShape( _
+        msoShapeRectangle, flagLeft, flagTop, flagWidth, flagHeight)
+
+    shp.Name = namePrefix & "__FRAME"
+    shp.Fill.ForeColor.RGB = RGB(255, 255, 255)
+    shp.Line.ForeColor.RGB = RGB(180, 190, 200)
+    shp.Line.Weight = 0.75
+
+    Select Case teamIndex
+
+        Case 0 'Algeria
+            DrawFlagAlgeria ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 1 'Argentina
+            DrawFlagArgentina ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 2 'Australia
+            DrawFlagAustralia ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 3 'Austria
+            DrawFlagHorizontal3 ws, flagLeft, flagTop, flagWidth, flagHeight, _
+                RGB(237, 41, 57), RGB(255, 255, 255), RGB(237, 41, 57), namePrefix
+
+        Case 4 'Belgium
+            DrawFlagVertical3 ws, flagLeft, flagTop, flagWidth, flagHeight, _
+                RGB(0, 0, 0), RGB(255, 205, 0), RGB(239, 51, 64), namePrefix
+
+        Case 5 'Bosnia and Herzegovina
+            DrawFlagBosnia ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 6 'Brazil
+            DrawFlagBrazil ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 7 'Cabo Verde
+            DrawFlagCaboVerde ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 8 'Canada
+            DrawFlagCanada ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 9 'Colombia
+            DrawFlagColombia ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 10 'Congo DR
+            DrawFlagCongoDR ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 11 'Croatia
+            DrawFlagCroatia ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 12 'Curaçao
+            DrawFlagCuracao ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 13 'Czechia
+            DrawFlagCzechia ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 14 'Ecuador
+            DrawFlagEcuador ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 15 'Egypt
+            DrawFlagEgypt ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 16 'England
+            DrawFlagEngland ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 17 'France
+            DrawFlagVertical3 ws, flagLeft, flagTop, flagWidth, flagHeight, _
+                RGB(0, 35, 149), RGB(255, 255, 255), RGB(237, 41, 57), namePrefix
+
+        Case 18 'Germany
+            DrawFlagHorizontal3 ws, flagLeft, flagTop, flagWidth, flagHeight, _
+                RGB(0, 0, 0), RGB(221, 0, 0), RGB(255, 206, 0), namePrefix
+
+        Case 19 'Ghana
+            DrawFlagGhana ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 20 'Haiti
+            DrawFlagHaiti ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 21 'IR Iran
+            DrawFlagIran ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 22 'Iraq
+            DrawFlagIraq ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 23 'Japan
+            DrawFlagJapan ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 24 'Jordan
+            DrawFlagJordan ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 25 'Korea Republic
+            DrawFlagKorea ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 26 'Mexico
+            DrawFlagMexico ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 27 'Morocco
+            DrawFlagMorocco ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 28 'Netherlands
+            DrawFlagHorizontal3 ws, flagLeft, flagTop, flagWidth, flagHeight, _
+                RGB(174, 28, 40), RGB(255, 255, 255), RGB(33, 70, 139), namePrefix
+
+        Case 29 'New Zealand
+            DrawFlagNewZealand ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 30 'Norway
+            DrawFlagNordicCross ws, flagLeft, flagTop, flagWidth, flagHeight, _
+                RGB(186, 12, 47), RGB(255, 255, 255), RGB(0, 40, 104), namePrefix
+
+        Case 31 'Panama
+            DrawFlagPanama ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 32 'Paraguay
+            DrawFlagHorizontal3 ws, flagLeft, flagTop, flagWidth, flagHeight, _
+                RGB(213, 43, 30), RGB(255, 255, 255), RGB(0, 56, 147), namePrefix
+
+        Case 33 'Portugal
+            DrawFlagPortugal ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 34 'Qatar
+            DrawFlagQatar ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 35 'Saudi Arabia
+            DrawFlagSaudi ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 36 'Scotland
+            DrawFlagScotland ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 37 'Senegal
+            DrawFlagSenegal ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 38 'South Africa
+            DrawFlagSouthAfrica ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 39 'Spain
+            DrawFlagSpain ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 40 'Sweden
+            DrawFlagNordicCross ws, flagLeft, flagTop, flagWidth, flagHeight, _
+                RGB(0, 106, 167), RGB(254, 204, 0), RGB(254, 204, 0), namePrefix
+
+        Case 41 'Switzerland
+            DrawFlagSwitzerland ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 42 'Tunisia
+            DrawFlagTunisia ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 43 'Türkiye
+            DrawFlagTurkey ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 44 'USA
+            DrawFlagUSA ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 45 'Uruguay
+            DrawFlagUruguay ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 46 'Uzbekistan
+            DrawFlagUzbekistan ws, flagLeft, flagTop, flagWidth, flagHeight, namePrefix
+
+        Case 47 'Côte d'Ivoire
+            DrawFlagVertical3 ws, flagLeft, flagTop, flagWidth, flagHeight, _
+                RGB(255, 136, 62), RGB(255, 255, 255), RGB(0, 158, 96), namePrefix
+
+    End Select
+
+End Sub
+
+
+Private Sub AddFlagRect( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal fillColor As Long, _
+    ByVal shapeName As String)
+
+    Dim shp As Shape
+
+    Set shp = ws.Shapes.AddShape( _
+        msoShapeRectangle, _
+        flagLeft, flagTop, flagWidth, flagHeight)
+
+    shp.Name = shapeName
+    shp.Fill.ForeColor.RGB = fillColor
+    shp.Line.Visible = msoFalse
+
+End Sub
+
+
+Private Sub AddFlagOval( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal fillColor As Long, _
+    ByVal shapeName As String)
+
+    Dim shp As Shape
+
+    Set shp = ws.Shapes.AddShape( _
+        msoShapeOval, _
+        flagLeft, flagTop, flagWidth, flagHeight)
+
+    shp.Name = shapeName
+    shp.Fill.ForeColor.RGB = fillColor
+    shp.Line.Visible = msoFalse
+
+End Sub
+
+
+Private Sub AddFlagStar( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal fillColor As Long, _
+    ByVal shapeName As String)
+
+    Dim shp As Shape
+
+    Set shp = ws.Shapes.AddShape( _
+        msoShape5pointStar, _
+        flagLeft, flagTop, flagWidth, flagHeight)
+
+    shp.Name = shapeName
+    shp.Fill.ForeColor.RGB = fillColor
+    shp.Line.Visible = msoFalse
+
+End Sub
+
+
+Private Sub AddFlagCrescent( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal crescentColor As Long, _
+    ByVal backgroundColor As Long, _
+    ByVal shapeName As String)
+
+    AddFlagOval ws, flagLeft, flagTop, flagWidth, flagHeight, _
+        crescentColor, shapeName & "__OUTER"
+
+    AddFlagOval ws, _
+        flagLeft + flagWidth * 0.28, _
+        flagTop - flagHeight * 0.02, _
+        flagWidth * 0.82, _
+        flagHeight * 1.04, _
+        backgroundColor, shapeName & "__INNER"
+
+End Sub
+
+
+Private Sub AddFlagTriangle( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal fillColor As Long, _
+    ByVal shapeName As String, _
+    Optional ByVal rotation As Double = 0)
+
+    Dim shp As Shape
+
+    Set shp = ws.Shapes.AddShape( _
+        msoShapeIsoscelesTriangle, _
+        flagLeft, flagTop, flagWidth, flagHeight)
+
+    shp.Name = shapeName
+    shp.Fill.ForeColor.RGB = fillColor
+    shp.Line.Visible = msoFalse
+    shp.rotation = rotation
+
+End Sub
+
+
+Private Sub AddFlagPieSegment( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal fillColor As Long, _
+    ByVal startAngle As Double, _
+    ByVal endAngle As Double, _
+    ByVal shapeName As String)
+
+    Dim shp As Shape
+
+    Set shp = ws.Shapes.AddShape( _
+        msoShapePie, flagLeft, flagTop, flagWidth, flagHeight)
+
+    shp.Name = shapeName
+
+    On Error Resume Next
+    shp.Adjustments.Item(1) = startAngle
+    shp.Adjustments.Item(2) = endAngle
+    On Error GoTo 0
+
+    shp.Fill.ForeColor.RGB = fillColor
+    shp.Line.Visible = msoFalse
+
+End Sub
+
+
+Private Sub DrawFlagNordicCross( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal baseColor As Long, _
+    ByVal outerColor As Long, _
+    ByVal innerColor As Long, _
+    ByVal namePrefix As String)
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight, baseColor, namePrefix & "__BASE"
+
+    AddFlagRect ws, flagLeft + flagWidth * 0.3, flagTop, flagWidth * 0.24, flagHeight, _
+        outerColor, namePrefix & "__VO"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight * 0.38, flagWidth, flagHeight * 0.24, _
+        outerColor, namePrefix & "__HO"
+
+    AddFlagRect ws, flagLeft + flagWidth * 0.36, flagTop, flagWidth * 0.12, flagHeight, _
+        innerColor, namePrefix & "__VI"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight * 0.44, flagWidth, flagHeight * 0.12, _
+        innerColor, namePrefix & "__HI"
+
+End Sub
+
+
+Private Sub DrawFlagUnionJack( _
+    ByVal ws As Worksheet, _
+    ByVal cjLeft As Double, _
+    ByVal cjTop As Double, _
+    ByVal cjW As Double, _
+    ByVal cjH As Double, _
+    ByVal namePrefix As String)
+
+    Dim shp As Shape
+    Dim diagAngle As Double
+    Dim diagLen As Double
+
+    diagAngle = Atn(cjH / cjW) * 180 / (Atn(1) * 4)
+    diagLen = Sqr(cjW * cjW + cjH * cjH) * 1.3
+
+    AddFlagRect ws, cjLeft, cjTop, cjW, cjH, RGB(0, 36, 125), namePrefix & "__CJBASE"
+
+    Set shp = ws.Shapes.AddShape(msoShapeRectangle, _
+        cjLeft + cjW / 2 - diagLen / 2, _
+        cjTop + cjH / 2 - cjH * 0.15, _
+        diagLen, cjH * 0.3)
+    shp.Name = namePrefix & "__CJD1"
+    shp.Fill.ForeColor.RGB = RGB(255, 255, 255)
+    shp.Line.Visible = msoFalse
+    shp.rotation = diagAngle
+
+    Set shp = ws.Shapes.AddShape(msoShapeRectangle, _
+        cjLeft + cjW / 2 - diagLen / 2, _
+        cjTop + cjH / 2 - cjH * 0.15, _
+        diagLen, cjH * 0.3)
+    shp.Name = namePrefix & "__CJD2"
+    shp.Fill.ForeColor.RGB = RGB(255, 255, 255)
+    shp.Line.Visible = msoFalse
+    shp.rotation = -diagAngle
+
+    Set shp = ws.Shapes.AddShape(msoShapeRectangle, _
+        cjLeft + cjW / 2 - diagLen / 2, _
+        cjTop + cjH / 2 - cjH * 0.07, _
+        diagLen, cjH * 0.14)
+    shp.Name = namePrefix & "__CJD3"
+    shp.Fill.ForeColor.RGB = RGB(206, 17, 38)
+    shp.Line.Visible = msoFalse
+    shp.rotation = diagAngle
+
+    Set shp = ws.Shapes.AddShape(msoShapeRectangle, _
+        cjLeft + cjW / 2 - diagLen / 2, _
+        cjTop + cjH / 2 - cjH * 0.07, _
+        diagLen, cjH * 0.14)
+    shp.Name = namePrefix & "__CJD4"
+    shp.Fill.ForeColor.RGB = RGB(206, 17, 38)
+    shp.Line.Visible = msoFalse
+    shp.rotation = -diagAngle
+
+    AddFlagRect ws, cjLeft + cjW * 0.4, cjTop, cjW * 0.2, cjH, _
+        RGB(255, 255, 255), namePrefix & "__CJWV"
+    AddFlagRect ws, cjLeft, cjTop + cjH * 0.35, cjW, cjH * 0.3, _
+        RGB(255, 255, 255), namePrefix & "__CJWH"
+
+    AddFlagRect ws, cjLeft + cjW * 0.44, cjTop, cjW * 0.12, cjH, _
+        RGB(206, 17, 38), namePrefix & "__CJRV"
+    AddFlagRect ws, cjLeft, cjTop + cjH * 0.4, cjW, cjH * 0.2, _
+        RGB(206, 17, 38), namePrefix & "__CJRH"
+
+End Sub
+
+
+Private Sub AddFlagTrigram( _
+    ByVal ws As Worksheet, _
+    ByVal barLeft As Double, _
+    ByVal barTop As Double, _
+    ByVal barWidth As Double, _
+    ByVal barHeight As Double, _
+    ByVal pattern As String, _
+    ByVal namePrefix As String)
+
+    Dim i As Long
+
+    For i = 1 To 3
+
+        If Mid$(pattern, i, 1) = "S" Then
+
+            AddFlagRect ws, barLeft, barTop + (i - 1) * barHeight * 1.8, _
+                barWidth, barHeight, RGB(0, 0, 0), namePrefix & "_B" & i
+
+        Else
+
+            AddFlagRect ws, barLeft, barTop + (i - 1) * barHeight * 1.8, _
+                barWidth * 0.42, barHeight, RGB(0, 0, 0), namePrefix & "_B" & i & "A"
+            AddFlagRect ws, barLeft + barWidth * 0.58, barTop + (i - 1) * barHeight * 1.8, _
+                barWidth * 0.42, barHeight, RGB(0, 0, 0), namePrefix & "_B" & i & "B"
+
+        End If
+
+    Next i
+
+End Sub
+
+
+Private Sub DrawFlagAlgeria( _
+    ByVal ws As Worksheet, ByVal flagLeft As Double, ByVal flagTop As Double, _
+    ByVal flagWidth As Double, ByVal flagHeight As Double, ByVal namePrefix As String)
+
+    DrawFlagVertical ws, flagLeft, flagTop, flagWidth, flagHeight, _
+        RGB(0, 123, 58), RGB(255, 255, 255), namePrefix
+    AddFlagCrescent ws, flagLeft + flagWidth * 0.39, flagTop + flagHeight * 0.27, _
+        flagWidth * 0.18, flagHeight * 0.46, RGB(206, 17, 38), RGB(255, 255, 255), namePrefix _
+        & "__CRESCENT"
+    AddFlagStar ws, flagLeft + flagWidth * 0.5, flagTop + flagHeight * 0.36, _
+        flagWidth * 0.1, flagHeight * 0.18, RGB(206, 17, 38), namePrefix & "__STAR"
+
+End Sub
+
+
+Private Sub DrawFlagCroatia( _
+    ByVal ws As Worksheet, ByVal flagLeft As Double, ByVal flagTop As Double, _
+    ByVal flagWidth As Double, ByVal flagHeight As Double, ByVal namePrefix As String)
+
+    Dim r As Long, c As Long
+    Dim cellCol As Long
+
+    DrawFlagHorizontal3 ws, flagLeft, flagTop, flagWidth, flagHeight, _
+        RGB(206, 17, 38), RGB(255, 255, 255), RGB(23, 68, 132), namePrefix
+    'Checkerboard coat of arms in the centre (5 x 5, red first).
+    For r = 0 To 4
+        For c = 0 To 4
+            If (r + c) Mod 2 = 0 Then
+                cellCol = RGB(206, 17, 38)
+            Else
+                cellCol = RGB(255, 255, 255)
+            End If
+            AddFlagRect ws, _
+                flagLeft + flagWidth * (0.415 + c * 0.034), _
+                flagTop + flagHeight * (0.31 + r * 0.062), _
+                flagWidth * 0.034, flagHeight * 0.062, cellCol, _
+                namePrefix & "__CHECK_" & CStr(r) & "_" & CStr(c)
+        Next c
+    Next r
+
+End Sub
+
+
+Private Sub DrawFlagEgypt( _
+    ByVal ws As Worksheet, ByVal flagLeft As Double, ByVal flagTop As Double, _
+    ByVal flagWidth As Double, ByVal flagHeight As Double, ByVal namePrefix As String)
+
+    DrawFlagHorizontal3 ws, flagLeft, flagTop, flagWidth, flagHeight, _
+        RGB(206, 17, 38), RGB(255, 255, 255), RGB(0, 0, 0), namePrefix
+    AddFlagRect ws, flagLeft + flagWidth * 0.45, flagTop + flagHeight * 0.36, _
+        flagWidth * 0.1, flagHeight * 0.28, RGB(200, 160, 40), namePrefix & "__EAGLE"
+    AddFlagRect ws, flagLeft + flagWidth * 0.46, flagTop + flagHeight * 0.32, _
+        flagWidth * 0.08, flagHeight * 0.05, RGB(200, 160, 40), namePrefix & _
+        "__EAGLEHEAD"
+
+End Sub
+
+
+Private Sub DrawFlagIran( _
+    ByVal ws As Worksheet, ByVal flagLeft As Double, ByVal flagTop As Double, _
+    ByVal flagWidth As Double, ByVal flagHeight As Double, ByVal namePrefix As String)
+
+    DrawFlagHorizontal3 ws, flagLeft, flagTop, flagWidth, flagHeight, _
+        RGB(35, 125, 63), RGB(255, 255, 255), RGB(218, 41, 28), namePrefix
+    AddFlagStar ws, flagLeft + flagWidth * 0.47, flagTop + flagHeight * 0.41, _
+        flagWidth * 0.07, flagHeight * 0.12, RGB(218, 41, 28), namePrefix & "__EMBLEM"
+
+End Sub
+
+
+Private Sub DrawFlagIraq( _
+    ByVal ws As Worksheet, ByVal flagLeft As Double, ByVal flagTop As Double, _
+    ByVal flagWidth As Double, ByVal flagHeight As Double, ByVal namePrefix As String)
+
+    DrawFlagHorizontal3 ws, flagLeft, flagTop, flagWidth, flagHeight, _
+        RGB(206, 17, 38), RGB(255, 255, 255), RGB(0, 0, 0), namePrefix
+    AddFlagRect ws, flagLeft + flagWidth * 0.34, flagTop + flagHeight * 0.47, _
+        flagWidth * 0.32, flagHeight * 0.07, RGB(0, 122, 61), namePrefix & "__TAKBIR"
+
+End Sub
+
+
+Private Sub DrawFlagMexico( _
+    ByVal ws As Worksheet, ByVal flagLeft As Double, ByVal flagTop As Double, _
+    ByVal flagWidth As Double, ByVal flagHeight As Double, ByVal namePrefix As String)
+
+    DrawFlagVertical3 ws, flagLeft, flagTop, flagWidth, flagHeight, _
+        RGB(0, 104, 71), RGB(255, 255, 255), RGB(206, 17, 38), namePrefix
+    AddFlagOval ws, flagLeft + flagWidth * 0.455, flagTop + flagHeight * 0.36, _
+        flagWidth * 0.09, flagHeight * 0.2, RGB(145, 90, 40), namePrefix & "__EAGLE"
+    AddFlagRect ws, flagLeft + flagWidth * 0.47, flagTop + flagHeight * 0.5, _
+        flagWidth * 0.06, flagHeight * 0.04, RGB(0, 104, 71), namePrefix & "__SNAKE"
+
+End Sub
+
+
+Private Sub DrawFlagPortugal( _
+    ByVal ws As Worksheet, ByVal flagLeft As Double, ByVal flagTop As Double, _
+    ByVal flagWidth As Double, ByVal flagHeight As Double, ByVal namePrefix As String)
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth * 0.4, flagHeight, RGB(0, 102, 0), _
+        namePrefix & "__GREEN"
+    AddFlagRect ws, flagLeft + flagWidth * 0.4, flagTop, flagWidth * 0.6, flagHeight, _
+        RGB(255, 0, 0), namePrefix & "__RED"
+    AddFlagOval ws, flagLeft + flagWidth * 0.32, flagTop + flagHeight * 0.22, _
+        flagWidth * 0.2, flagHeight * 0.56, RGB(255, 205, 0), namePrefix & "__ARMILLARY"
+    AddFlagOval ws, flagLeft + flagWidth * 0.37, flagTop + flagHeight * 0.31, _
+        flagWidth * 0.1, flagHeight * 0.38, RGB(206, 17, 38), namePrefix & "__SHIELD"
+    AddFlagStar ws, flagLeft + flagWidth * 0.395, flagTop + flagHeight * 0.36, _
+        flagWidth * 0.045, flagHeight * 0.08, RGB(255, 255, 255), namePrefix & _
+        "__SHIELDSTAR"
+
+End Sub
+
+
+Private Sub DrawFlagQatar( _
+    ByVal ws As Worksheet, ByVal flagLeft As Double, ByVal flagTop As Double, _
+    ByVal flagWidth As Double, ByVal flagHeight As Double, ByVal namePrefix As String)
+
+    Dim shp As Shape
+    Dim i As Long
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth * 0.27, flagHeight, _
+        RGB(255, 255, 255), namePrefix & "__WHITE"
+    AddFlagRect ws, flagLeft + flagWidth * 0.27, flagTop, flagWidth * 0.73, flagHeight, _
+        RGB(139, 0, 40), namePrefix & "__MAROON"
+
+    'Nine white serrated points along the hoist edge.
+    For i = 0 To 8
+        Set shp = ws.Shapes.AddShape(msoShapeIsoscelesTriangle, _
+            flagLeft + flagWidth * 0.3 - flagHeight / 18, _
+            flagTop + (i + 0.5) * flagHeight / 9 - flagWidth * 0.03, _
+            flagHeight / 9, flagWidth * 0.06)
+        shp.Name = namePrefix & "__TOOTH" & CStr(i)
+        shp.Fill.ForeColor.RGB = RGB(255, 255, 255)
+        shp.Line.Visible = msoFalse
+        shp.rotation = 90
+    Next i
+
+End Sub
+
+
+Private Sub DrawFlagSenegal( _
+    ByVal ws As Worksheet, ByVal flagLeft As Double, ByVal flagTop As Double, _
+    ByVal flagWidth As Double, ByVal flagHeight As Double, ByVal namePrefix As String)
+
+    DrawFlagVertical3 ws, flagLeft, flagTop, flagWidth, flagHeight, _
+        RGB(0, 133, 66), RGB(252, 209, 22), RGB(239, 51, 64), namePrefix
+    AddFlagStar ws, flagLeft + flagWidth * 0.445, flagTop + flagHeight * 0.36, _
+        flagWidth * 0.11, flagHeight * 0.22, RGB(0, 122, 61), namePrefix & "__STAR"
+
+End Sub
+
+
+Private Sub DrawFlagVertical( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal color1 As Long, _
+    ByVal color2 As Long, _
+    ByVal namePrefix As String)
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth / 2, flagHeight, color1, namePrefix & "__1"
+    AddFlagRect ws, flagLeft + flagWidth / 2, flagTop, flagWidth / 2, flagHeight, color2, _
+        namePrefix & "__2"
+
+End Sub
+
+
+Private Sub DrawFlagVertical2( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal color1 As Long, _
+    ByVal color2 As Long, _
+    ByVal namePrefix As String)
+
+    DrawFlagVertical ws, flagLeft, flagTop, flagWidth, flagHeight, color1, color2, namePrefix
+
+End Sub
+
+
+Private Sub DrawFlagVertical3( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal color1 As Long, _
+    ByVal color2 As Long, _
+    ByVal color3 As Long, _
+    ByVal namePrefix As String)
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth / 3, flagHeight, color1, namePrefix & "__1"
+    AddFlagRect ws, flagLeft + flagWidth / 3, flagTop, flagWidth / 3, flagHeight, color2, _
+        namePrefix & "__2"
+    AddFlagRect ws, flagLeft + (flagWidth * 2 / 3), flagTop, flagWidth / 3, flagHeight, color3, _
+        namePrefix & "__3"
+
+End Sub
+
+
+Private Sub DrawFlagHorizontal2( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal color1 As Long, _
+    ByVal color2 As Long, _
+    ByVal namePrefix As String)
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight / 2, color1, namePrefix & "__1"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight / 2, flagWidth, flagHeight / 2, color2, _
+        namePrefix & "__2"
+
+End Sub
+
+
+Private Sub DrawFlagHorizontal3( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal color1 As Long, _
+    ByVal color2 As Long, _
+    ByVal color3 As Long, _
+    ByVal namePrefix As String)
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight / 3, color1, namePrefix & "__1"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight / 3, flagWidth, flagHeight / 3, color2, _
+        namePrefix & "__2"
+    AddFlagRect ws, flagLeft, flagTop + (flagHeight * 2 / 3), flagWidth, flagHeight / 3, color3, _
+        namePrefix & "__3"
+
+End Sub
+
+
+Private Sub DrawFlagCross( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal baseColor As Long, _
+    ByVal crossColor As Long, _
+    ByVal innerColor As Long, _
+    ByVal namePrefix As String)
+
+    Dim shp As Shape
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight, baseColor, namePrefix & _
+        "__BASE2"
+
+    AddFlagRect ws, _
+        flagLeft, flagTop + flagHeight * 0.36, _
+        flagWidth, flagHeight * 0.28, crossColor, namePrefix & "__H1"
+
+    AddFlagRect ws, _
+        flagLeft + flagWidth * 0.36, flagTop, _
+        flagWidth * 0.28, flagHeight, crossColor, namePrefix & "__V1"
+
+    If innerColor <> crossColor Then
+
+        AddFlagRect ws, _
+            flagLeft, flagTop + flagHeight * 0.41, _
+            flagWidth, flagHeight * 0.18, innerColor, namePrefix & "__H2"
+
+        AddFlagRect ws, _
+            flagLeft + flagWidth * 0.41, flagTop, _
+            flagWidth * 0.18, flagHeight, innerColor, namePrefix & "__V2"
+
+    End If
+
+End Sub
+
+
+Private Sub DrawFlagEngland( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    DrawFlagCross ws, flagLeft, flagTop, flagWidth, flagHeight, _
+        RGB(255, 255, 255), RGB(206, 17, 38), RGB(206, 17, 38), namePrefix
+
+End Sub
+
+
+Private Sub DrawFlagSwitzerland( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight, RGB(218, 41, 28), namePrefix _
+        & "__BASE"
+    AddFlagRect ws, flagLeft + flagWidth * 0.4, flagTop + flagHeight * 0.18, _
+        flagWidth * 0.2, flagHeight * 0.64, RGB(255, 255, 255), namePrefix & "__V"
+    AddFlagRect ws, flagLeft + flagWidth * 0.18, flagTop + flagHeight * 0.4, _
+        flagWidth * 0.64, flagHeight * 0.2, RGB(255, 255, 255), namePrefix & "__H"
+
+End Sub
+
+
+Private Sub DrawFlagJapan( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight, RGB(255, 255, 255), _
+        namePrefix & "__BASE"
+    AddFlagOval ws, flagLeft + flagWidth * 0.34, flagTop + flagHeight * 0.18, _
+        flagWidth * 0.32, flagHeight * 0.64, RGB(188, 0, 45), namePrefix & "__CIRCLE"
+
+End Sub
+
+
+Private Sub DrawFlagTunisia( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight, RGB(206, 17, 38), namePrefix _
+        & "__BASE"
+    AddFlagOval ws, flagLeft + flagWidth * 0.3, flagTop + flagHeight * 0.1, _
+        flagWidth * 0.4, flagHeight * 0.8, RGB(255, 255, 255), namePrefix & "__CIRCLE"
+    AddFlagCrescent ws, flagLeft + flagWidth * 0.38, flagTop + flagHeight * 0.29, _
+        flagWidth * 0.16, flagHeight * 0.4, RGB(206, 17, 38), RGB(255, 255, 255), _
+        namePrefix & "__CRESCENT"
+    AddFlagStar ws, flagLeft + flagWidth * 0.49, flagTop + flagHeight * 0.38, _
+        flagWidth * 0.1, flagHeight * 0.2, RGB(206, 17, 38), namePrefix & "__STAR"
+
+End Sub
+
+
+Private Sub DrawFlagTurkey( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight, RGB(227, 10, 23), namePrefix _
+        & "__BASE"
+    AddFlagCrescent ws, flagLeft + flagWidth * 0.23, flagTop + flagHeight * 0.2, _
+        flagWidth * 0.34, flagHeight * 0.6, RGB(255, 255, 255), RGB(227, 10, 23), _
+        namePrefix & "__CRESCENT"
+    AddFlagStar ws, flagLeft + flagWidth * 0.49, flagTop + flagHeight * 0.34, _
+        flagWidth * 0.18, flagHeight * 0.3, RGB(255, 255, 255), namePrefix & "__STAR"
+
+End Sub
+
+
+Private Sub DrawFlagMorocco( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight, RGB(193, 39, 45), namePrefix & _
+        "__BASE"
+    'Interlaced pentagram: green star with the field colour punched through the middle.
+    AddFlagStar ws, flagLeft + flagWidth * 0.36, flagTop + flagHeight * 0.2, _
+        flagWidth * 0.28, flagHeight * 0.6, RGB(0, 98, 51), namePrefix & "__STAR"
+    AddFlagStar ws, flagLeft + flagWidth * 0.42, flagTop + flagHeight * 0.33, _
+        flagWidth * 0.16, flagHeight * 0.34, RGB(193, 39, 45), namePrefix & "__STARIN"
+
+End Sub
+
+
+Private Sub DrawFlagSaudi( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight, RGB(0, 122, 61), namePrefix & _
+        "__BASE"
+    AddFlagRect ws, flagLeft + flagWidth * 0.18, flagTop + flagHeight * 0.38, _
+        flagWidth * 0.64, flagHeight * 0.08, RGB(255, 255, 255), namePrefix & "__TEXT1"
+    AddFlagRect ws, flagLeft + flagWidth * 0.3, flagTop + flagHeight * 0.58, _
+        flagWidth * 0.4, flagHeight * 0.045, RGB(255, 255, 255), namePrefix & "__SWORD"
+    AddFlagRect ws, flagLeft + flagWidth * 0.36, flagTop + flagHeight * 0.54, _
+        flagWidth * 0.28, flagHeight * 0.045, RGB(255, 255, 255), namePrefix & _
+        "__SWORD2"
+
+End Sub
+
+
+Private Sub DrawFlagCaboVerde( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    Dim i As Long
+    Dim ang As Double
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight, RGB(0, 56, 147), namePrefix & _
+        "__BASE"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight * 0.6, flagWidth, flagHeight * 0.1, _
+        RGB(255, 255, 255), namePrefix & "__W1"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight * 0.7, flagWidth, flagHeight * 0.1, _
+        RGB(206, 17, 38), namePrefix & "__RED"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight * 0.8, flagWidth, flagHeight * 0.1, _
+        RGB(255, 255, 255), namePrefix & "__W2"
+
+    'Ring of ten gold stars centred on the stripes.
+    For i = 0 To 9
+        ang = i * 36 * (Atn(1) * 4) / 180
+        AddFlagStar ws, _
+            flagLeft + flagWidth * 0.42 + flagWidth * 0.115 * Cos(ang) - flagWidth * 0.022, _
+            flagTop + flagHeight * 0.7 + flagHeight * 0.16 * Sin(ang) - flagHeight * 0.033, _
+            flagWidth * 0.044, flagHeight * 0.066, RGB(255, 205, 0), namePrefix & "__ST" & CStr(i)
+    Next i
+
+End Sub
+
+
+Private Sub DrawFlagCanada( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    DrawFlagVertical3 ws, flagLeft, flagTop, flagWidth, flagHeight, _
+        RGB(213, 43, 30), RGB(255, 255, 255), RGB(213, 43, 30), namePrefix
+    AddFlagStar ws, flagLeft + flagWidth * 0.42, flagTop + flagHeight * 0.22, _
+        flagWidth * 0.16, flagHeight * 0.56, RGB(213, 43, 30), namePrefix & "__MAPLE"
+
+End Sub
+
+
+Private Sub DrawFlagBrazil( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    Dim shp As Shape
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight, RGB(0, 156, 59), namePrefix & _
+        "__BASE"
+
+    Set shp = ws.Shapes.AddShape(msoShapeDiamond, _
+        flagLeft + flagWidth * 0.26, flagTop + flagHeight * 0.08, _
+        flagWidth * 0.48, flagHeight * 0.84)
+    shp.Name = namePrefix & "__DIAMOND"
+    shp.Fill.ForeColor.RGB = RGB(255, 223, 0)
+    shp.Line.Visible = msoFalse
+
+    AddFlagOval ws, flagLeft + flagWidth * 0.37, flagTop + flagHeight * 0.25, _
+        flagWidth * 0.26, flagHeight * 0.5, RGB(0, 39, 118), namePrefix & "__CIRCLE"
+    AddFlagRect ws, flagLeft + flagWidth * 0.38, flagTop + flagHeight * 0.44, _
+        flagWidth * 0.24, flagHeight * 0.045, RGB(255, 255, 255), namePrefix & "__BAND"
+
+    AddFlagStar ws, flagLeft + flagWidth * 0.42, flagTop + flagHeight * 0.29, _
+        flagWidth * 0.035, flagHeight * 0.07, RGB(255, 255, 255), namePrefix & "__S1"
+    AddFlagStar ws, flagLeft + flagWidth * 0.47, flagTop + flagHeight * 0.31, _
+        flagWidth * 0.035, flagHeight * 0.07, RGB(255, 255, 255), namePrefix & "__S2"
+    AddFlagStar ws, flagLeft + flagWidth * 0.52, flagTop + flagHeight * 0.33, _
+        flagWidth * 0.035, flagHeight * 0.07, RGB(255, 255, 255), namePrefix & "__S3"
+    AddFlagStar ws, flagLeft + flagWidth * 0.45, flagTop + flagHeight * 0.55, _
+        flagWidth * 0.035, flagHeight * 0.07, RGB(255, 255, 255), namePrefix & "__S4"
+    AddFlagStar ws, flagLeft + flagWidth * 0.5, flagTop + flagHeight * 0.57, _
+        flagWidth * 0.035, flagHeight * 0.07, RGB(255, 255, 255), namePrefix & "__S5"
+
+End Sub
+
+
+Private Sub DrawFlagAustralia( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    Dim shp As Shape
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight, RGB(0, 36, 125), namePrefix & _
+        "__BASE"
+
+    'Union Jack canton.
+    DrawFlagUnionJack ws, flagLeft, flagTop, flagWidth * 0.5, flagHeight * 0.5, namePrefix & "__CJ"
+
+    'Commonwealth Star (7-pointed) below the canton.
+    Set shp = ws.Shapes.AddShape(msoShape7pointStar, _
+        flagLeft + flagWidth * 0.17, flagTop + flagHeight * 0.6, _
+        flagWidth * 0.16, flagHeight * 0.3)
+    shp.Name = namePrefix & "__CWSTAR"
+    shp.Fill.ForeColor.RGB = RGB(255, 255, 255)
+    shp.Line.Visible = msoFalse
+
+    'Southern Cross.
+    AddFlagStar ws, flagLeft + flagWidth * 0.7, flagTop + flagHeight * 0.1, _
+        flagWidth * 0.075, flagHeight * 0.15, RGB(255, 255, 255), namePrefix & "__ALPHA"
+    AddFlagStar ws, flagLeft + flagWidth * 0.83, flagTop + flagHeight * 0.34, _
+        flagWidth * 0.07, flagHeight * 0.14, RGB(255, 255, 255), namePrefix & "__BETA"
+    AddFlagStar ws, flagLeft + flagWidth * 0.63, flagTop + flagHeight * 0.46, _
+        flagWidth * 0.07, flagHeight * 0.14, RGB(255, 255, 255), namePrefix & "__GAMMA"
+    AddFlagStar ws, flagLeft + flagWidth * 0.75, flagTop + flagHeight * 0.68, _
+        flagWidth * 0.09, flagHeight * 0.18, RGB(255, 255, 255), namePrefix & "__DELTA"
+    AddFlagStar ws, flagLeft + flagWidth * 0.72, flagTop + flagHeight * 0.5, _
+        flagWidth * 0.035, flagHeight * 0.07, RGB(255, 255, 255), namePrefix & "__EPSILON"
+
+End Sub
+
+
+Private Sub DrawFlagBosnia( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    Dim shp As Shape
+    Dim i As Long
+    Dim t As Double
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight, RGB(0, 56, 147), namePrefix & _
+        "__BASE"
+
+    Set shp = ws.Shapes.AddShape( _
+        msoShapeRightTriangle, _
+        flagLeft + flagWidth * 0.2, _
+        flagTop, _
+        flagWidth * 0.7, _
+        flagHeight)
+
+    shp.Name = namePrefix & "__TRIANGLE"
+    shp.Fill.ForeColor.RGB = RGB(255, 205, 0)
+    shp.Line.Visible = msoFalse
+
+    'Nine white stars running along the hypotenuse.
+    For i = 0 To 8
+        t = i / 8
+        AddFlagStar ws, _
+            flagLeft + flagWidth * (0.215 + t * 0.63), _
+            flagTop + flagHeight * (0.025 + t * 0.87), _
+            flagWidth * 0.055, flagHeight * 0.085, RGB(255, 255, 255), namePrefix & "__ST" & CStr(i)
+    Next i
+
+End Sub
+
+
+Private Sub DrawFlagCongoDR( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    Dim shp As Shape
+    Dim diagAngle As Double
+    Dim diagLen As Double
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight, RGB(0, 114, 188), namePrefix _
+        & "__BASE"
+
+    diagAngle = Atn(flagHeight / flagWidth) * 180 / (Atn(1) * 4)
+    diagLen = flagWidth * 1.6
+
+    'Yellow diagonal band (forms the border of the red stripe).
+    Set shp = ws.Shapes.AddShape(msoShapeRectangle, _
+        flagLeft + flagWidth * 0.5 - diagLen / 2, _
+        flagTop + flagHeight * 0.5 - flagHeight * 0.17, _
+        diagLen, flagHeight * 0.34)
+    shp.Name = namePrefix & "__GOLD"
+    shp.Fill.ForeColor.RGB = RGB(247, 214, 24)
+    shp.Line.Visible = msoFalse
+    shp.rotation = -diagAngle
+
+    'Red diagonal stripe on top of the yellow band.
+    Set shp = ws.Shapes.AddShape(msoShapeRectangle, _
+        flagLeft + flagWidth * 0.5 - diagLen / 2, _
+        flagTop + flagHeight * 0.5 - flagHeight * 0.1, _
+        diagLen, flagHeight * 0.2)
+    shp.Name = namePrefix & "__RED"
+    shp.Fill.ForeColor.RGB = RGB(206, 17, 38)
+    shp.Line.Visible = msoFalse
+    shp.rotation = -diagAngle
+
+    AddFlagStar ws, flagLeft + flagWidth * 0.04, flagTop + flagHeight * 0.08, _
+        flagWidth * 0.1, flagHeight * 0.18, RGB(247, 214, 24), namePrefix & "__STAR"
+
+End Sub
+
+
+Private Sub DrawFlagCuracao( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight, RGB(0, 43, 127), namePrefix & _
+        "__BASE"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight * 0.66, flagWidth, flagHeight * 0.1, _
+        RGB(255, 205, 0), namePrefix & "__STRIPE"
+    AddFlagStar ws, flagLeft + flagWidth * 0.105, flagTop + flagHeight * 0.18, _
+        flagWidth * 0.11, flagHeight * 0.2, RGB(255, 255, 255), namePrefix & "__STAR1"
+    AddFlagStar ws, flagLeft + flagWidth * 0.3, flagTop + flagHeight * 0.075, _
+        flagWidth * 0.066, flagHeight * 0.11, RGB(255, 255, 255), namePrefix & "__STAR2"
+
+End Sub
+
+
+Private Sub DrawFlagCzechia( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    Dim shp As Shape
+
+    DrawFlagHorizontal2 ws, flagLeft, flagTop, flagWidth, flagHeight, _
+        RGB(255, 255, 255), RGB(206, 17, 38), namePrefix
+
+    Set shp = ws.Shapes.AddShape( _
+        msoShapeRightTriangle, _
+        flagLeft, flagTop, flagWidth * 0.5, flagHeight)
+
+    shp.Name = namePrefix & "__BLUE"
+    shp.Fill.ForeColor.RGB = RGB(17, 69, 126)
+    shp.Line.Visible = msoFalse
+
+End Sub
+
+
+Private Sub DrawFlagGhana( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    DrawFlagHorizontal3 ws, flagLeft, flagTop, flagWidth, flagHeight, _
+        RGB(206, 17, 38), RGB(252, 209, 22), RGB(0, 122, 61), namePrefix
+    AddFlagStar ws, flagLeft + flagWidth * 0.42, flagTop + flagHeight * 0.34, _
+        flagWidth * 0.16, flagHeight * 0.3, RGB(0, 0, 0), namePrefix & "__STAR"
+
+End Sub
+
+
+Private Sub DrawFlagJordan( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    DrawFlagHorizontal3 ws, flagLeft, flagTop, flagWidth, flagHeight, _
+        RGB(0, 0, 0), RGB(255, 255, 255), RGB(0, 122, 61), namePrefix
+    AddFlagTriangle ws, flagLeft - flagWidth * 0.04, flagTop + flagHeight * 0.08, _
+        flagWidth * 0.45, flagHeight * 0.84, RGB(206, 17, 38), namePrefix & "__TRIANGLE", _
+        270
+    AddFlagStar ws, flagLeft + flagWidth * 0.105, flagTop + flagHeight * 0.4, _
+        flagWidth * 0.09, flagHeight * 0.16, RGB(255, 255, 255), namePrefix & "__STAR"
+
+End Sub
+
+
+Private Sub DrawFlagKorea( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    Dim tr As Double
+    Dim tcx As Double
+    Dim tcy As Double
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight, RGB(255, 255, 255), namePrefix _
+        & "__BASE"
+
+    'Taegeuk: blue circle, red upper half, small circles forming the S-curve.
+    tr = flagHeight * 0.24
+    tcx = flagLeft + flagWidth * 0.5
+    tcy = flagTop + flagHeight * 0.5
+
+    AddFlagOval ws, tcx - tr, tcy - tr, tr * 2, tr * 2, RGB(0, 71, 160), namePrefix & "__TBLUE"
+
+    AddFlagPieSegment ws, tcx - tr, tcy - tr, tr * 2, tr * 2, RGB(205, 46, 58), _
+        180, 270, namePrefix & "__TQ1"
+    AddFlagPieSegment ws, tcx - tr, tcy - tr, tr * 2, tr * 2, RGB(205, 46, 58), _
+        270, 360, namePrefix & "__TQ2"
+
+    AddFlagOval ws, tcx - tr, tcy - tr / 2, tr, tr, RGB(205, 46, 58), namePrefix & "__TSL"
+    AddFlagOval ws, tcx, tcy - tr / 2, tr, tr, RGB(0, 71, 160), namePrefix & "__TSR"
+
+    'Four trigrams: Geon, Gam, Ri, Gon.
+    AddFlagTrigram ws, flagLeft + flagWidth * 0.13, flagTop + flagHeight * 0.1, _
+        flagWidth * 0.2, flagHeight * 0.035, "SSS", namePrefix & "__TL"
+    AddFlagTrigram ws, flagLeft + flagWidth * 0.67, flagTop + flagHeight * 0.1, _
+        flagWidth * 0.2, flagHeight * 0.035, "BSB", namePrefix & "__TRG"
+    AddFlagTrigram ws, flagLeft + flagWidth * 0.13, flagTop + flagHeight * 0.76, _
+        flagWidth * 0.2, flagHeight * 0.035, "SBS", namePrefix & "__BL"
+    AddFlagTrigram ws, flagLeft + flagWidth * 0.67, flagTop + flagHeight * 0.76, _
+        flagWidth * 0.2, flagHeight * 0.035, "BBB", namePrefix & "__BR"
+
+End Sub
+
+
+Private Sub DrawFlagNewZealand( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight, RGB(0, 36, 125), namePrefix & _
+        "__BASE"
+
+    'Union Jack canton.
+    DrawFlagUnionJack ws, flagLeft, flagTop, flagWidth * 0.5, flagHeight * 0.5, namePrefix & "__CJ"
+
+    'Southern Cross: four red stars with white borders.
+    AddFlagStar ws, flagLeft + flagWidth * 0.74 - flagWidth * 0.055, _
+        flagTop + flagHeight * 0.24 - flagHeight * 0.1, _
+        flagWidth * 0.11, flagHeight * 0.2, RGB(255, 255, 255), namePrefix & "__S1W"
+    AddFlagStar ws, flagLeft + flagWidth * 0.74 - flagWidth * 0.04, _
+        flagTop + flagHeight * 0.24 - flagHeight * 0.075, _
+        flagWidth * 0.08, flagHeight * 0.15, RGB(206, 17, 38), namePrefix & "__S1R"
+
+    AddFlagStar ws, flagLeft + flagWidth * 0.87 - flagWidth * 0.05, _
+        flagTop + flagHeight * 0.47 - flagHeight * 0.09, _
+        flagWidth * 0.1, flagHeight * 0.18, RGB(255, 255, 255), namePrefix & "__S2W"
+    AddFlagStar ws, flagLeft + flagWidth * 0.87 - flagWidth * 0.036, _
+        flagTop + flagHeight * 0.47 - flagHeight * 0.066, _
+        flagWidth * 0.072, flagHeight * 0.132, RGB(206, 17, 38), namePrefix & "__S2R"
+
+    AddFlagStar ws, flagLeft + flagWidth * 0.63 - flagWidth * 0.05, _
+        flagTop + flagHeight * 0.5 - flagHeight * 0.09, _
+        flagWidth * 0.1, flagHeight * 0.18, RGB(255, 255, 255), namePrefix & "__S3W"
+    AddFlagStar ws, flagLeft + flagWidth * 0.63 - flagWidth * 0.036, _
+        flagTop + flagHeight * 0.5 - flagHeight * 0.066, _
+        flagWidth * 0.072, flagHeight * 0.132, RGB(206, 17, 38), namePrefix & "__S3R"
+
+    AddFlagStar ws, flagLeft + flagWidth * 0.76 - flagWidth * 0.055, _
+        flagTop + flagHeight * 0.78 - flagHeight * 0.1, _
+        flagWidth * 0.11, flagHeight * 0.2, RGB(255, 255, 255), namePrefix & "__S4W"
+    AddFlagStar ws, flagLeft + flagWidth * 0.76 - flagWidth * 0.04, _
+        flagTop + flagHeight * 0.78 - flagHeight * 0.075, _
+        flagWidth * 0.08, flagHeight * 0.15, RGB(206, 17, 38), namePrefix & "__S4R"
+
+End Sub
+
+
+Private Sub DrawFlagPanama( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth / 2, flagHeight / 2, RGB(255, 255, 255), _
+        namePrefix & "__TL"
+    AddFlagRect ws, flagLeft + flagWidth / 2, flagTop, flagWidth / 2, flagHeight / 2, _
+        RGB(206, 17, 38), namePrefix & "__TR"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight / 2, flagWidth / 2, flagHeight / 2, _
+        RGB(0, 56, 147), namePrefix & "__BL"
+    AddFlagRect ws, flagLeft + flagWidth / 2, flagTop + flagHeight / 2, flagWidth / 2, _
+        flagHeight / 2, RGB(255, 255, 255), namePrefix & "__BR"
+    AddFlagStar ws, flagLeft + flagWidth * 0.16, flagTop + flagHeight * 0.14, flagWidth * _
+        0.12, flagHeight * 0.2, RGB(0, 56, 147), namePrefix & "__BLUESTAR"
+    AddFlagStar ws, flagLeft + flagWidth * 0.67, flagTop + flagHeight * 0.64, flagWidth * _
+        0.12, flagHeight * 0.2, RGB(206, 17, 38), namePrefix & "__REDSTAR"
+
+End Sub
+
+
+Private Sub DrawFlagScotland( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    Dim shp As Shape
+    Dim diagAngle As Double
+    Dim diagLen As Double
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight, RGB(0, 94, 184), namePrefix & _
+        "__BASE"
+
+    'Saltire: two white diagonal bands crossing in the centre.
+    diagAngle = Atn(flagHeight / flagWidth) * 180 / (Atn(1) * 4)
+    diagLen = Sqr(flagWidth * flagWidth + flagHeight * flagHeight) * 1.25
+
+    Set shp = ws.Shapes.AddShape(msoShapeRectangle, _
+        flagLeft + flagWidth / 2 - diagLen / 2, _
+        flagTop + flagHeight / 2 - flagHeight * 0.14, _
+        diagLen, flagHeight * 0.28)
+    shp.Name = namePrefix & "__D1"
+    shp.Fill.ForeColor.RGB = RGB(255, 255, 255)
+    shp.Line.Visible = msoFalse
+    shp.rotation = diagAngle
+
+    Set shp = ws.Shapes.AddShape(msoShapeRectangle, _
+        flagLeft + flagWidth / 2 - diagLen / 2, _
+        flagTop + flagHeight / 2 - flagHeight * 0.14, _
+        diagLen, flagHeight * 0.28)
+    shp.Name = namePrefix & "__D2"
+    shp.Fill.ForeColor.RGB = RGB(255, 255, 255)
+    shp.Line.Visible = msoFalse
+    shp.rotation = -diagAngle
+
+End Sub
+
+
+Private Sub DrawFlagSouthAfrica( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    Dim shp As Shape
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight, RGB(0, 35, 149), namePrefix & _
+        "__BASE"
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight * 0.5, RGB(222, 56, 49), _
+        namePrefix & "__REDBAND"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight * 0.5, flagWidth, flagHeight * 0.5, _
+        RGB(0, 35, 149), namePrefix & "__BLUEBAND"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight * 0.24, flagWidth, flagHeight * 0.52, _
+        RGB(255, 255, 255), namePrefix & "__WHITE"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight * 0.3, flagWidth, flagHeight * 0.4, _
+        RGB(0, 119, 73), namePrefix & "__GREEN"
+
+    'Gold triangle (border of the black wedge) pointing into the flag.
+    Set shp = ws.Shapes.AddShape(msoShapeIsoscelesTriangle, _
+        flagLeft - flagWidth * 0.06, flagTop + flagHeight * 0.1, _
+        flagWidth * 0.6, flagHeight * 0.8)
+    shp.Name = namePrefix & "__GOLD"
+    shp.Fill.ForeColor.RGB = RGB(255, 184, 28)
+    shp.Line.Visible = msoFalse
+    shp.rotation = 90
+
+    'Black wedge.
+    Set shp = ws.Shapes.AddShape(msoShapeIsoscelesTriangle, _
+        flagLeft, flagTop + flagHeight * 0.2, _
+        flagWidth * 0.42, flagHeight * 0.6)
+    shp.Name = namePrefix & "__BLACK"
+    shp.Fill.ForeColor.RGB = RGB(0, 0, 0)
+    shp.Line.Visible = msoFalse
+    shp.rotation = 90
+
+End Sub
+
+
+Private Sub DrawFlagHaiti( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight / 2, RGB(0, 32, 140), _
+        namePrefix & "__BLUE"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight / 2, flagWidth, flagHeight / 2, _
+        RGB(210, 16, 52), namePrefix & "__RED"
+    AddFlagRect ws, flagLeft + flagWidth * 0.38, flagTop + flagHeight * 0.32, _
+        flagWidth * 0.24, flagHeight * 0.36, RGB(255, 255, 255), namePrefix & "__PANEL"
+    AddFlagOval ws, flagLeft + flagWidth * 0.45, flagTop + flagHeight * 0.4, _
+        flagWidth * 0.1, flagHeight * 0.2, RGB(0, 98, 51), namePrefix & "__EMBLEM"
+
+End Sub
+
+
+Private Sub DrawFlagUSA( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    Dim i As Long, r As Long, c As Long
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight, RGB(255, 255, 255), namePrefix _
+        & "__BASE"
+
+    'Seven red stripes of the thirteen.
+    For i = 0 To 12 Step 2
+        AddFlagRect ws, flagLeft, flagTop + (i * flagHeight / 13), _
+            flagWidth, flagHeight / 13, RGB(179, 25, 66), namePrefix & "__STR" & CStr(i)
+    Next i
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth * 0.42, flagHeight * 7 / 13, RGB(10, 49, 97), _
+        namePrefix & "__CANTON"
+
+    'Stars in offset rows: 6 / 5 / 6 / 5 / 6.
+    For r = 0 To 4
+        If r Mod 2 = 0 Then
+            For c = 0 To 5
+                AddFlagStar ws, _
+                    flagLeft + flagWidth * (0.04 + c * 0.066), _
+                    flagTop + flagHeight * (0.055 + r * 0.105), _
+                    flagWidth * 0.024, flagHeight * 0.042, _
+                    RGB(255, 255, 255), _
+                    namePrefix & "__STAR_" & CStr(r) & "_" & CStr(c)
+            Next c
+        Else
+            For c = 0 To 4
+                AddFlagStar ws, _
+                    flagLeft + flagWidth * (0.073 + c * 0.066), _
+                    flagTop + flagHeight * (0.055 + r * 0.105), _
+                    flagWidth * 0.024, flagHeight * 0.042, _
+                    RGB(255, 255, 255), _
+                    namePrefix & "__STAR_" & CStr(r) & "_" & CStr(c)
+            Next c
+        End If
+    Next r
+
+End Sub
+
+
+Private Sub DrawFlagUruguay( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    Dim i As Long
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight, RGB(255, 255, 255), namePrefix _
+        & "__BASE"
+
+    'Four blue stripes of the nine.
+    For i = 1 To 7 Step 2
+        AddFlagRect ws, flagLeft, flagTop + (i * flagHeight / 9), flagWidth, flagHeight / 9, _
+            RGB(0, 56, 168), namePrefix & "__ST" & CStr(i)
+    Next i
+
+    'White canton with the golden sun.
+    AddFlagRect ws, flagLeft, flagTop, flagWidth * 0.4, flagHeight * 5 / 9, _
+        RGB(255, 255, 255), namePrefix & "__CANTON"
+    AddFlagOval ws, flagLeft + flagWidth * 0.06, flagTop + flagHeight * 0.1, _
+        flagWidth * 0.26, flagHeight * 0.34, RGB(252, 209, 22), namePrefix & "__SUN"
+    AddFlagOval ws, flagLeft + flagWidth * 0.1, flagTop + flagHeight * 0.16, _
+        flagWidth * 0.18, flagHeight * 0.22, RGB(252, 209, 22), namePrefix & "__SUN2"
+
+End Sub
+
+
+Private Sub DrawFlagUzbekistan( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    Dim i As Long
+    Dim c As Long
+    Dim starX As Double
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight / 3, RGB(0, 153, 181), _
+        namePrefix & "__BLUE"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight / 3, flagWidth, flagHeight / 3, RGB(255, _
+        255, 255), namePrefix & "__WHITE"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight * 2 / 3, flagWidth, flagHeight / 3, RGB(0, _
+        146, 69), namePrefix & "__GREEN"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight * 0.31, flagWidth, flagHeight * 0.04, _
+        RGB(206, 17, 38), namePrefix & "__R1"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight * 0.65, flagWidth, flagHeight * 0.04, _
+        RGB(206, 17, 38), namePrefix & "__R2"
+
+    'White crescent in the canton.
+    AddFlagCrescent ws, flagLeft + flagWidth * 0.05, flagTop + flagHeight * 0.05, _
+        flagWidth * 0.09, flagHeight * 0.16, RGB(255, 255, 255), RGB(0, 153, 181), _
+        namePrefix & "__CRESCENT"
+
+    'Twelve stars in three rows (3 / 4 / 5).
+    For i = 0 To 2
+        For c = 0 To 2 + i
+            starX = 0.5 + i * 0.028 + c * 0.088
+            AddFlagOval ws, _
+                flagLeft + flagWidth * starX, _
+                flagTop + flagHeight * (0.045 + i * 0.075), _
+                flagWidth * 0.03, flagHeight * 0.05, RGB(255, 255, 255), _
+                namePrefix & "__ST" & CStr(i) & "_" & CStr(c)
+        Next c
+    Next i
+
+End Sub
+
+
+Private Sub DrawFlagArgentina( _
+    ByVal ws As Worksheet, ByVal flagLeft As Double, ByVal flagTop As Double, _
+    ByVal flagWidth As Double, ByVal flagHeight As Double, ByVal namePrefix As String)
+
+    DrawFlagHorizontal3 ws, flagLeft, flagTop, flagWidth, flagHeight, _
+        RGB(116, 172, 223), RGB(255, 255, 255), RGB(116, 172, 223), namePrefix
+    AddFlagOval ws, flagLeft + flagWidth * 0.43, flagTop + flagHeight * 0.3, _
+        flagWidth * 0.14, flagHeight * 0.28, RGB(252, 209, 22), namePrefix & "__SUN"
+    AddFlagStar ws, flagLeft + flagWidth * 0.447, flagTop + flagHeight * 0.31, _
+        flagWidth * 0.105, flagHeight * 0.2, RGB(252, 209, 22), namePrefix & "__SUNSTAR"
+
+End Sub
+
+
+Private Sub DrawFlagColombia( _
+    ByVal ws As Worksheet, ByVal flagLeft As Double, ByVal flagTop As Double, _
+    ByVal flagWidth As Double, ByVal flagHeight As Double, ByVal namePrefix As String)
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight * 0.5, RGB(252, 209, 22), _
+        namePrefix & "__YELLOW"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight * 0.5, flagWidth, flagHeight * 0.25, _
+        RGB(0, 56, 147), namePrefix & "__BLUE"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight * 0.75, flagWidth, flagHeight * 0.25, _
+        RGB(206, 17, 38), namePrefix & "__RED"
+
+End Sub
+
+
+Private Sub DrawFlagEcuador( _
+    ByVal ws As Worksheet, ByVal flagLeft As Double, ByVal flagTop As Double, _
+    ByVal flagWidth As Double, ByVal flagHeight As Double, ByVal namePrefix As String)
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight * 0.5, RGB(255, 221, 0), _
+        namePrefix & "__YELLOW"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight * 0.5, flagWidth, flagHeight * 0.25, _
+        RGB(3, 83, 164), namePrefix & "__BLUE"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight * 0.75, flagWidth, flagHeight * 0.25, _
+        RGB(206, 17, 38), namePrefix & "__RED"
+    AddFlagOval ws, flagLeft + flagWidth * 0.4, flagTop + flagHeight * 0.27, _
+        flagWidth * 0.2, flagHeight * 0.3, RGB(120, 80, 40), namePrefix & "__EMBLEM"
+    AddFlagStar ws, flagLeft + flagWidth * 0.46, flagTop + flagHeight * 0.3, _
+        flagWidth * 0.08, flagHeight * 0.12, RGB(255, 221, 0), namePrefix & "__STAR"
+
+End Sub
+
+
+Private Sub DrawFlagSpain( _
+    ByVal ws As Worksheet, _
+    ByVal flagLeft As Double, _
+    ByVal flagTop As Double, _
+    ByVal flagWidth As Double, _
+    ByVal flagHeight As Double, _
+    ByVal namePrefix As String)
+
+    AddFlagRect ws, flagLeft, flagTop, flagWidth, flagHeight * 0.25, RGB(198, 0, 43), _
+        namePrefix & "__RED1"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight * 0.25, flagWidth, flagHeight * 0.5, _
+        RGB(255, 196, 0), namePrefix & "__YELLOW"
+    AddFlagRect ws, flagLeft, flagTop + flagHeight * 0.75, flagWidth, flagHeight * 0.25, _
+        RGB(198, 0, 43), namePrefix & "__RED2"
+    AddFlagRect ws, flagLeft + flagWidth * 0.22, flagTop + flagHeight * 0.4, _
+        flagWidth * 0.06, flagHeight * 0.2, RGB(170, 0, 0), namePrefix & "__COAT"
+    AddFlagStar ws, flagLeft + flagWidth * 0.235, flagTop + flagHeight * 0.42, _
+        flagWidth * 0.025, flagHeight * 0.05, RGB(255, 196, 0), namePrefix & "__COATSTAR"
+
+End Sub
+
+
+Private Function TeamFlag(ByVal teamIndex As Long) As String
+
+    Dim firstLetter As Long
+    Dim secondLetter As Long
+
+    Select Case teamIndex
+
+        Case 0: firstLetter = 3: secondLetter = 25
+        Case 1: firstLetter = 0: secondLetter = 17
+        Case 2: firstLetter = 0: secondLetter = 20
+        Case 3: firstLetter = 0: secondLetter = 19
+        Case 4: firstLetter = 1: secondLetter = 4
+        Case 5: firstLetter = 1: secondLetter = 0
+        Case 6: firstLetter = 1: secondLetter = 17
+        Case 7: firstLetter = 2: secondLetter = 21
+        Case 8: firstLetter = 2: secondLetter = 0
+        Case 9: firstLetter = 2: secondLetter = 14
+        Case 10: firstLetter = 2: secondLetter = 3
+        Case 11: firstLetter = 7: secondLetter = 17
+        Case 12: firstLetter = 2: secondLetter = 22
+        Case 13: firstLetter = 2: secondLetter = 25
+        Case 14: firstLetter = 4: secondLetter = 2
+        Case 15: firstLetter = 4: secondLetter = 6
+        Case 16: firstLetter = 6: secondLetter = 1
+        Case 17: firstLetter = 5: secondLetter = 17
+        Case 18: firstLetter = 3: secondLetter = 4
+        Case 19: firstLetter = 6: secondLetter = 7
+        Case 20: firstLetter = 7: secondLetter = 19
+        Case 21: firstLetter = 8: secondLetter = 17
+        Case 22: firstLetter = 8: secondLetter = 16
+        Case 23: firstLetter = 9: secondLetter = 15
+        Case 24: firstLetter = 9: secondLetter = 14
+        Case 25: firstLetter = 10: secondLetter = 17
+        Case 26: firstLetter = 12: secondLetter = 23
+        Case 27: firstLetter = 12: secondLetter = 0
+        Case 28: firstLetter = 13: secondLetter = 11
+        Case 29: firstLetter = 13: secondLetter = 25
+        Case 30: firstLetter = 13: secondLetter = 14
+        Case 31: firstLetter = 15: secondLetter = 0
+        Case 32: firstLetter = 15: secondLetter = 24
+        Case 33: firstLetter = 15: secondLetter = 19
+        Case 34: firstLetter = 16: secondLetter = 0
+        Case 35: firstLetter = 18: secondLetter = 0
+        Case 36: firstLetter = 6: secondLetter = 1
+        Case 37: firstLetter = 18: secondLetter = 13
+        Case 38: firstLetter = 25: secondLetter = 0
+        Case 39: firstLetter = 4: secondLetter = 18
+        Case 40: firstLetter = 18: secondLetter = 4
+        Case 41: firstLetter = 2: secondLetter = 7
+        Case 42: firstLetter = 19: secondLetter = 13
+        Case 43: firstLetter = 19: secondLetter = 17
+        Case 44: firstLetter = 20: secondLetter = 18
+        Case 45: firstLetter = 20: secondLetter = 24
+        Case 46: firstLetter = 20: secondLetter = 25
+        Case 47: firstLetter = 2: secondLetter = 8
+
+    End Select
+
+    TeamFlag = ChrW(&HD83C) & ChrW(&HDDE6 + firstLetter) & _
+        ChrW(&HD83C) & ChrW(&HDDE6 + secondLetter)
+
+End Function
+
+'=========================================================
+' START LEVEL
+'=========================================================
+
+Private Sub StartLevel()
+
+    Dim oldScreenUpdating As Boolean
+
+    oldScreenUpdating = Application.ScreenUpdating
+
+    '=========================================================
+    ' SPEED OPTIMISATION
+    '
+    ' The maze is drawn one cell at a time. Turning screen
+    ' updating off while the level is being created prevents
+    ' Excel from repainting the worksheet after every cell.
+    ' The finished maze is then shown all at once.
+    '=========================================================
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+
+    On Error GoTo RestoreScreenAndRaise
+
+    CancelTimer
+
+    'Save checkpoint for this level
+    levelStartScore = score
+    levelStartGoals = goalsCollected
+
+    lives = LivesForLevel()
+
+    gameRunning = True
+    gamePaused = False
+
+    'Bring back the chilled music for the new level.
+    StartMusic
+
+    currentMazeSize = MazeSizeForLevel()
+
+    SetupDashboard
+
+    If BuildMaze() = False Then
+
+        Application.Calculation = xlCalculationAutomatic
+        Application.EnableEvents = True
+        Application.ScreenUpdating = oldScreenUpdating
+
+        gameRunning = False
+
+        UnbindArrowKeys
+
+        MsgBox "The maze could not be created." & vbCrLf & vbCrLf & _
+            "Please try starting the game again.", _
+            vbCritical, _
+            "World Cup Escape"
+
+        Exit Sub
+
+    End If
+
+    levelStartElapsedSeconds = GetElapsedSeconds()
+
+    UpdateDashboard
+
+    'Draw the team flag once per level (not on every move).
+    RefreshDashboardTeamFlag
+
+    SetStatus "PLAYING"
+
+    UpdateTimer
+
+    'Show the completed maze only after all drawing is finished.
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    Application.ScreenUpdating = oldScreenUpdating
+
+    Exit Sub
+
+RestoreScreenAndRaise:
+
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    Application.ScreenUpdating = oldScreenUpdating
+
+    Err.Raise Err.Number, Err.Source, Err.Description
+
+End Sub
+
+'=========================================================
+' BUILD MAZE
+'=========================================================
+
+Private Function BuildMaze() As Boolean
+
+    Dim ws As Worksheet
+    Dim bgRow As Long
+
+    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
+
+    BuildMaze = False
+
+    currentMazeSize = MazeSizeForLevel()
+
+    'Clear previous maze
+    ws.Range( _
+        ws.Cells(MAZE_TOP, MAZE_LEFT), _
+        ws.Cells( _
+            MAZE_TOP + MAX_MAZE_SIZE - 1, _
+            MAZE_LEFT + MAX_MAZE_SIZE - 1) _
+    ).Clear
+
+    'Restore the stadium background over the cleared area so
+    'no white gaps are left around a smaller maze.
+    For bgRow = MAZE_TOP To MAZE_TOP + MAX_MAZE_SIZE - 1
+
+        If ((bgRow - 1) \ 4) Mod 2 = 0 Then
+
+            ws.Range( _
+                ws.Cells(bgRow, MAZE_LEFT), _
+                ws.Cells(bgRow, MAZE_LEFT + MAX_MAZE_SIZE - 1) _
+            ).Interior.Color = RGB(27, 84, 50)
+
+        Else
+
+            ws.Range( _
+                ws.Cells(bgRow, MAZE_LEFT), _
+                ws.Cells(bgRow, MAZE_LEFT + MAX_MAZE_SIZE - 1) _
+            ).Interior.Color = RGB(16, 53, 32)
+
+        End If
+
+    Next bgRow
+
+    GeneratePerfectMaze
+
+    If FindSolutionPath() = False Then
+        Exit Function
+    End If
+
+    If CreateGuaranteedAlternativeRoute() = False Then
+        Exit Function
+    End If
+
+    AddExtraRoutes
+
+    'Find safe route again after extra routes
+    If FindSolutionPath() = False Then
+        Exit Function
+    End If
+
+    PlaceTraps
+
+    PlaceGoals
+
+    'Place World Cup Trophy at exit
+    mazeData( _
+        currentMazeSize - 2, _
+        currentMazeSize - 2) = "E"
+
+    playerRow = MAZE_TOP + 1
+    playerCol = MAZE_LEFT + 1
+
+    startRow = playerRow
+    startCol = playerCol
+
+    DrawFullMaze
+
+    BuildMaze = True
+
+End Function
+
+'=========================================================
+' GENERATE PERFECT MAZE
+'=========================================================
+
+Private Sub GeneratePerfectMaze()
+
+    Dim visited(0 To 22, 0 To 22) As Boolean
+
+    Dim stackR(0 To 528) As Long
+    Dim stackC(0 To 528) As Long
+
+    Dim possibleR(1 To 4) As Long
+    Dim possibleC(1 To 4) As Long
+
+    Dim currentR As Long
+    Dim currentC As Long
+
+    Dim newR As Long
+    Dim newC As Long
+
+    Dim wallR As Long
+    Dim wallC As Long
+
+    Dim optionCount As Long
+    Dim selectedOption As Long
+
+    Dim top As Long
+
+    Dim r As Long
+    Dim c As Long
+
+    'Start with a completely closed maze
+    For r = 0 To MAX_MAZE_SIZE - 1
+
+        For c = 0 To MAX_MAZE_SIZE - 1
+
+            mazeData(r, c) = "#"
+            solutionPath(r, c) = False
+            visited(r, c) = False
+
+        Next c
+
+    Next r
+
+    'Starting position
+    currentR = 1
+    currentC = 1
+
+    mazeData(currentR, currentC) = "."
+
+    visited(currentR, currentC) = True
+
+    top = 0
+
+    stackR(top) = currentR
+    stackC(top) = currentC
+
+    Do While top >= 0
+
+        currentR = stackR(top)
+        currentC = stackC(top)
+
+        optionCount = 0
+
+        '---------------------------------------------
+        ' UP
+        '---------------------------------------------
+        newR = currentR - 2
+        newC = currentC
+
+        If newR > 0 Then
+
+            If visited(newR, newC) = False Then
+
+                optionCount = optionCount + 1
+                possibleR(optionCount) = newR
+                possibleC(optionCount) = newC
+
+            End If
+
+        End If
+
+        '---------------------------------------------
+        ' DOWN
+        '---------------------------------------------
+        newR = currentR + 2
+        newC = currentC
+
+        If newR < currentMazeSize - 1 Then
+
+            If visited(newR, newC) = False Then
+
+                optionCount = optionCount + 1
+                possibleR(optionCount) = newR
+                possibleC(optionCount) = newC
+
+            End If
+
+        End If
+
+        '---------------------------------------------
+        ' LEFT
+        '---------------------------------------------
+        newR = currentR
+        newC = currentC - 2
+
+        If newC > 0 Then
+
+            If visited(newR, newC) = False Then
+
+                optionCount = optionCount + 1
+                possibleR(optionCount) = newR
+                possibleC(optionCount) = newC
+
+            End If
+
+        End If
+
+        '---------------------------------------------
+        ' RIGHT
+        '---------------------------------------------
+        newR = currentR
+        newC = currentC + 2
+
+        If newC < currentMazeSize - 1 Then
+
+            If visited(newR, newC) = False Then
+
+                optionCount = optionCount + 1
+                possibleR(optionCount) = newR
+                possibleC(optionCount) = newC
+
+            End If
+
+        End If
+
+        '---------------------------------------------
+        ' MOVE TO RANDOM UNVISITED CELL
+        '---------------------------------------------
+        If optionCount > 0 Then
+
+            selectedOption = Int(Rnd * optionCount) + 1
+
+            newR = possibleR(selectedOption)
+            newC = possibleC(selectedOption)
+
+            wallR = (currentR + newR) \ 2
+            wallC = (currentC + newC) \ 2
+
+            mazeData(wallR, wallC) = "."
+            mazeData(newR, newC) = "."
+
+            visited(newR, newC) = True
+
+            top = top + 1
+
+            stackR(top) = newR
+            stackC(top) = newC
+
+        Else
+
+            top = top - 1
+
+        End If
+
+    Loop
+
+End Sub
+
+'=========================================================
+' FIND SAFE SOLUTION PATH
+'=========================================================
+
+Private Function FindSolutionPath() As Boolean
+
+    Dim visited(0 To 22, 0 To 22) As Boolean
+
+    Dim previousR(0 To 22, 0 To 22) As Long
+    Dim previousC(0 To 22, 0 To 22) As Long
+
+    Dim queueR(0 To 528) As Long
+    Dim queueC(0 To 528) As Long
+
+    Dim head As Long
+    Dim tail As Long
+
+    Dim currentR As Long
+    Dim currentC As Long
+
+    Dim newR As Long
+    Dim newC As Long
+
+    Dim exitR As Long
+    Dim exitC As Long
+
+    Dim tempR As Long
+    Dim tempC As Long
+
+    Dim r As Long
+    Dim c As Long
+
+    exitR = currentMazeSize - 2
+    exitC = currentMazeSize - 2
+
+    'Reset search information
+    For r = 0 To currentMazeSize - 1
+
+        For c = 0 To currentMazeSize - 1
+
+            visited(r, c) = False
+            solutionPath(r, c) = False
+            previousR(r, c) = -1
+            previousC(r, c) = -1
+
+        Next c
+
+    Next r
+
+    head = 0
+    tail = 0
+
+    queueR(0) = 1
+    queueC(0) = 1
+
+    visited(1, 1) = True
+
+    Do While head <= tail
+
+        currentR = queueR(head)
+        currentC = queueC(head)
+
+        head = head + 1
+
+        If currentR = exitR And currentC = exitC Then
+            Exit Do
+        End If
+
+        'UP
+        newR = currentR - 1
+        newC = currentC
+
+        AddToSearchQueue _
+            newR, newC, _
+            currentR, currentC, _
+            visited, previousR, previousC, _
+            queueR, queueC, tail
+
+        'DOWN
+        newR = currentR + 1
+        newC = currentC
+
+        AddToSearchQueue _
+            newR, newC, _
+            currentR, currentC, _
+            visited, previousR, previousC, _
+            queueR, queueC, tail
+
+        'LEFT
+        newR = currentR
+        newC = currentC - 1
+
+        AddToSearchQueue _
+            newR, newC, _
+            currentR, currentC, _
+            visited, previousR, previousC, _
+            queueR, queueC, tail
+
+        'RIGHT
+        newR = currentR
+        newC = currentC + 1
+
+        AddToSearchQueue _
+            newR, newC, _
+            currentR, currentC, _
+            visited, previousR, previousC, _
+            queueR, queueC, tail
+
+    Loop
+
+    If visited(exitR, exitC) = False Then
+
+        FindSolutionPath = False
+
+        Exit Function
+
+    End If
+
+    'Trace path backwards
+    currentR = exitR
+    currentC = exitC
+
+    Do
+
+        solutionPath(currentR, currentC) = True
+
+        If currentR = 1 And currentC = 1 Then
+            Exit Do
+        End If
+
+        tempR = previousR(currentR, currentC)
+        tempC = previousC(currentR, currentC)
+
+        currentR = tempR
+        currentC = tempC
+
+    Loop
+
+    FindSolutionPath = True
+
+End Function
+
+'=========================================================
+' ADD SEARCH POSITION
+'=========================================================
+
+Private Sub AddToSearchQueue( _
+    ByVal newR As Long, _
+    ByVal newC As Long, _
+    ByVal oldR As Long, _
+    ByVal oldC As Long, _
+    ByRef visited() As Boolean, _
+    ByRef previousR() As Long, _
+    ByRef previousC() As Long, _
+    ByRef queueR() As Long, _
+    ByRef queueC() As Long, _
+    ByRef tail As Long)
+
+    If newR < 0 Then Exit Sub
+
+    If newR >= currentMazeSize Then Exit Sub
+
+    If newC < 0 Then Exit Sub
+
+    If newC >= currentMazeSize Then Exit Sub
+
+    If visited(newR, newC) = True Then Exit Sub
+
+    If mazeData(newR, newC) = "#" Then Exit Sub
+
+    visited(newR, newC) = True
+
+    previousR(newR, newC) = oldR
+    previousC(newR, newC) = oldC
+
+    tail = tail + 1
+
+    queueR(tail) = newR
+    queueC(tail) = newC
+
+End Sub
+
+'=========================================================
+' GUARANTEED ALTERNATIVE ROUTE
+'=========================================================
+
+Private Function CreateGuaranteedAlternativeRoute() As Boolean
+
+    Dim r As Long
+    Dim c As Long
+
+    CreateGuaranteedAlternativeRoute = False
+
+    'Try vertical opening
+    For r = 2 To currentMazeSize - 3
+
+        For c = 1 To currentMazeSize - 2
+
+            If mazeData(r, c) = "#" Then
+
+                If solutionPath(r - 1, c) = True _
+                    And solutionPath(r + 1, c) = True Then
+
+                    mazeData(r, c) = "."
+
+                    CreateGuaranteedAlternativeRoute = True
+
+                    Exit Function
+
+                End If
+
+            End If
+
+        Next c
+
+    Next r
+
+    'Try horizontal opening
+    For r = 1 To currentMazeSize - 2
+
+        For c = 2 To currentMazeSize - 3
+
+            If mazeData(r, c) = "#" Then
+
+                If solutionPath(r, c - 1) = True _
+                    And solutionPath(r, c + 1) = True Then
+
+                    mazeData(r, c) = "."
+
+                    CreateGuaranteedAlternativeRoute = True
+
+                    Exit Function
+
+                End If
+
+            End If
+
+        Next c
+
+    Next r
+
+End Function
+
+'=========================================================
+' ADD EXTRA ROUTES
+'=========================================================
+
+Private Sub AddExtraRoutes()
+
+    Dim candidateR(1 To 528) As Long
+    Dim candidateC(1 To 528) As Long
+
+    Dim candidateCount As Long
+    Dim desiredRoutes As Long
+
+    Dim r As Long
+    Dim c As Long
+
+    Dim selected As Long
+    Dim i As Long
+
+    desiredRoutes = ExtraRouteCount()
+
+    candidateCount = 0
+
+    For r = 1 To currentMazeSize - 2
+
+        For c = 1 To currentMazeSize - 2
+
+            If mazeData(r, c) = "#" Then
+
+                If mazeData(r - 1, c) = "." _
+                    And mazeData(r + 1, c) = "." Then
+
+                    candidateCount = candidateCount + 1
+
+                    candidateR(candidateCount) = r
+                    candidateC(candidateCount) = c
+
+                ElseIf mazeData(r, c - 1) = "." _
+                    And mazeData(r, c + 1) = "." Then
+
+                    candidateCount = candidateCount + 1
+
+                    candidateR(candidateCount) = r
+                    candidateC(candidateCount) = c
+
+                End If
+
+            End If
+
+        Next c
+
+    Next r
+
+    For i = 1 To desiredRoutes
+
+        If candidateCount <= 0 Then Exit For
+
+        selected = Int(Rnd * candidateCount) + 1
+
+        mazeData( _
+            candidateR(selected), _
+            candidateC(selected)) = "."
+
+        candidateR(selected) = candidateR(candidateCount)
+        candidateC(selected) = candidateC(candidateCount)
+
+        candidateCount = candidateCount - 1
+
+    Next i
+
+End Sub
+
+'=========================================================
+' PLACE TRAPS
+'=========================================================
+
+Private Sub PlaceTraps()
+
+    Dim candidateR(1 To 528) As Long
+    Dim candidateC(1 To 528) As Long
+
+    Dim candidateCount As Long
+    Dim desiredTraps As Long
+
+    Dim r As Long
+    Dim c As Long
+
+    Dim selected As Long
+    Dim i As Long
+
+    desiredTraps = TrapCountForLevel()
+
+    candidateCount = 0
+
+    For r = 1 To currentMazeSize - 2
+
+        For c = 1 To currentMazeSize - 2
+
+            If mazeData(r, c) = "." Then
+
+                'Never place traps on guaranteed safe route
+                If solutionPath(r, c) = False Then
+
+                    'Keep traps away from start
+                    If Abs(r - 1) + Abs(c - 1) > 3 Then
+
+                        'Keep traps away from trophy
+                        If Abs(r - (currentMazeSize - 2)) _
+                            + Abs(c - (currentMazeSize - 2)) > 3 Then
+
+                            candidateCount = candidateCount + 1
+
+                            candidateR(candidateCount) = r
+                            candidateC(candidateCount) = c
+
+                        End If
+
+                    End If
+
+                End If
+
+            End If
+
+        Next c
+
+    Next r
+
+    For i = 1 To desiredTraps
+
+        If candidateCount <= 0 Then Exit For
+
+        selected = Int(Rnd * candidateCount) + 1
+
+        mazeData( _
+            candidateR(selected), _
+            candidateC(selected)) = "X"
+
+        candidateR(selected) = candidateR(candidateCount)
+        candidateC(selected) = candidateC(candidateCount)
+
+        candidateCount = candidateCount - 1
+
+    Next i
+
+End Sub
+
+'=========================================================
+' PLACE GOALS
+'=========================================================
+
+Private Sub PlaceGoals()
+
+    Dim candidateR(1 To 528) As Long
+    Dim candidateC(1 To 528) As Long
+
+    Dim candidateCount As Long
+    Dim desiredGoals As Long
+
+    Dim r As Long
+    Dim c As Long
+
+    Dim selected As Long
+    Dim i As Long
+
+    desiredGoals = GoalCountForLevel()
+
+    candidateCount = 0
+
+    For r = 1 To currentMazeSize - 2
+
+        For c = 1 To currentMazeSize - 2
+
+            If mazeData(r, c) = "." Then
+
+                If Not (r = 1 And c = 1) Then
+
+                    If Not ( _
+                        r = currentMazeSize - 2 _
+                        And c = currentMazeSize - 2) Then
+
+                        candidateCount = candidateCount + 1
+
+                        candidateR(candidateCount) = r
+                        candidateC(candidateCount) = c
+
+                    End If
+
+                End If
+
+            End If
+
+        Next c
+
+    Next r
+
+    For i = 1 To desiredGoals
+
+        If candidateCount <= 0 Then Exit For
+
+        selected = Int(Rnd * candidateCount) + 1
+
+        mazeData( _
+            candidateR(selected), _
+            candidateC(selected)) = "G"
+
+        candidateR(selected) = candidateR(candidateCount)
+        candidateC(selected) = candidateC(candidateCount)
+
+        candidateCount = candidateCount - 1
+
+    Next i
+
+End Sub
+
+'=========================================================
+' DRAW ENTIRE MAZE
+'=========================================================
+
+Private Sub DrawFullMaze()
+
+    Dim ws As Worksheet
+    Dim r As Long
+    Dim c As Long
+
+    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
+
+    'Draw maze
+    For r = 0 To currentMazeSize - 1
+
+        For c = 0 To currentMazeSize - 1
+
+            DrawMazeCell _
+                r, _
+                c, _
+                mazeData(r, c)
+
+        Next c
+
+    Next r
+
+    'Professional pitch border
+    StylePitchFrame
+
+    'Draw player
+    DrawPlayer
+
+    'Set maze column sizes
+    For c = MAZE_LEFT To _
+        MAZE_LEFT + currentMazeSize - 1
+
+        ws.Columns(c).ColumnWidth = 3.2
+
+    Next c
+
+    'Set maze row sizes
+    For r = MAZE_TOP To _
+        MAZE_TOP + currentMazeSize - 1
+
+        ws.Rows(r).RowHeight = 22
+
+    Next r
+
+End Sub
+
+'=========================================================
+' PROFESSIONAL PITCH BORDER
+'=========================================================
+
+Private Sub StylePitchFrame()
+
+    Dim ws As Worksheet
+    Dim pitchRange As Range
+
+    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
+
+    Set pitchRange = ws.Range( _
+        ws.Cells(MAZE_TOP, MAZE_LEFT), _
+        ws.Cells( _
+            MAZE_TOP + currentMazeSize - 1, _
+            MAZE_LEFT + currentMazeSize - 1) _
+    )
+
+    With pitchRange
+
+        .Borders(xlEdgeLeft).LineStyle = xlContinuous
+        .Borders(xlEdgeLeft).Weight = xlThick
+        .Borders(xlEdgeLeft).Color = RGB(255, 255, 255)
+
+        .Borders(xlEdgeRight).LineStyle = xlContinuous
+        .Borders(xlEdgeRight).Weight = xlThick
+        .Borders(xlEdgeRight).Color = RGB(255, 255, 255)
+
+        .Borders(xlEdgeTop).LineStyle = xlContinuous
+        .Borders(xlEdgeTop).Weight = xlThick
+        .Borders(xlEdgeTop).Color = RGB(255, 255, 255)
+
+        .Borders(xlEdgeBottom).LineStyle = xlContinuous
+        .Borders(xlEdgeBottom).Weight = xlThick
+        .Borders(xlEdgeBottom).Color = RGB(255, 255, 255)
+
+    End With
+
+End Sub
+
+'=========================================================
+' WORLD CUP SYMBOLS
+'=========================================================
+
+Private Function WorldCupSymbol(ByVal symbolName As String) As String
+
+    Select Case symbolName
+
+        Case "PLAYER"
+
+            'Footballer - the player is shown as a player,
+            'not as a ball.
+            WorldCupSymbol = ChrW(&HD83E) & ChrW(&HDD3E)
+
+        Case "GOAL"
+
+            WorldCupSymbol = ChrW(&H26BD)
+
+        Case "TROPHY"
+
+            WorldCupSymbol = ChrW(&HD83C) & ChrW(&HDFC6)
+
+        Case "TRAP"
+
+            WorldCupSymbol = ChrW(&H26A0)
+
+        Case "DEFENDER"
+
+            WorldCupSymbol = ChrW(&HD83D) & ChrW(&HDEE1)
+
+        Case Else
+
+            WorldCupSymbol = ""
+
+    End Select
+
+End Function
+
+'=========================================================
+' DRAW MAZE CELL
+'=========================================================
+
+Private Sub DrawMazeCell( _
+    ByVal gridRow As Long, _
+    ByVal gridCol As Long, _
+    ByVal symbol As String)
+
+    Dim ws As Worksheet
+    Dim currentCell As Range
+
+    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
+
+    Set currentCell = ws.Cells( _
+        MAZE_TOP + gridRow, _
+        MAZE_LEFT + gridCol)
+
+    '3D-style cell formatting
+    currentCell.value = ""
+
+    currentCell.HorizontalAlignment = xlCenter
+    currentCell.VerticalAlignment = xlCenter
+
+    currentCell.Font.Bold = True
+    currentCell.Font.Size = 15
+    currentCell.Font.Name = "Segoe UI Emoji"
+
+    currentCell.Borders.LineStyle = xlContinuous
+    currentCell.Borders.Weight = xlThin
+
+    '=========================================================
+    ' DEFENDER / WALL - RAISED 3D BLOCK
+    '=========================================================
+    If symbol = "#" Then
+
+        currentCell.value = WorldCupSymbol("DEFENDER")
+        currentCell.Interior.Color = RGB(25, 45, 70)
+        currentCell.Font.Color = RGB(255, 255, 255)
+
+        currentCell.Borders(xlEdgeTop).Color = RGB(120, 145, 170)
+        currentCell.Borders(xlEdgeLeft).Color = RGB(120, 145, 170)
+        currentCell.Borders(xlEdgeBottom).Color = RGB(8, 18, 30)
+        currentCell.Borders(xlEdgeRight).Color = RGB(8, 18, 30)
+        currentCell.Borders(xlEdgeTop).Weight = xlMedium
+        currentCell.Borders(xlEdgeLeft).Weight = xlMedium
+        currentCell.Borders(xlEdgeBottom).Weight = xlMedium
+        currentCell.Borders(xlEdgeRight).Weight = xlMedium
+
+        Exit Sub
+
+    End If
+
+    '=========================================================
+    ' NORMAL FOOTBALL PITCH - DEPTH EFFECT
+    '=========================================================
+    If symbol = "." Then
+
+        currentCell.Interior.Color = RGB(75, 145, 70)
+        currentCell.Font.Color = RGB(75, 145, 70)
+
+        currentCell.Borders(xlEdgeTop).Color = RGB(125, 185, 115)
+        currentCell.Borders(xlEdgeLeft).Color = RGB(125, 185, 115)
+        currentCell.Borders(xlEdgeBottom).Color = RGB(45, 95, 42)
+        currentCell.Borders(xlEdgeRight).Color = RGB(45, 95, 42)
+
+        Exit Sub
+
+    End If
+
+    '=========================================================
+    ' GOAL - RAISED GOLD TILE
+    '=========================================================
+    If symbol = "G" Then
+
+        currentCell.value = WorldCupSymbol("GOAL")
+        currentCell.Interior.Color = RGB(255, 215, 0)
+        currentCell.Font.Color = RGB(15, 35, 60)
+        currentCell.Font.Size = 16
+
+        currentCell.Borders(xlEdgeTop).Color = RGB(255, 245, 150)
+        currentCell.Borders(xlEdgeLeft).Color = RGB(255, 245, 150)
+        currentCell.Borders(xlEdgeBottom).Color = RGB(170, 120, 0)
+        currentCell.Borders(xlEdgeRight).Color = RGB(170, 120, 0)
+        currentCell.Borders(xlEdgeTop).Weight = xlMedium
+        currentCell.Borders(xlEdgeLeft).Weight = xlMedium
+        currentCell.Borders(xlEdgeBottom).Weight = xlMedium
+        currentCell.Borders(xlEdgeRight).Weight = xlMedium
+
+        Exit Sub
+
+    End If
+
+    '=========================================================
+    ' WORLD CUP TROPHY - RAISED GOLD TILE
+    '=========================================================
+    If symbol = "E" Then
+
+        currentCell.value = WorldCupSymbol("TROPHY")
+        currentCell.Interior.Color = RGB(255, 215, 0)
+        currentCell.Font.Color = RGB(120, 80, 0)
+        currentCell.Font.Size = 18
+
+        currentCell.Borders(xlEdgeTop).Color = RGB(255, 245, 150)
+        currentCell.Borders(xlEdgeLeft).Color = RGB(255, 245, 150)
+        currentCell.Borders(xlEdgeBottom).Color = RGB(170, 120, 0)
+        currentCell.Borders(xlEdgeRight).Color = RGB(170, 120, 0)
+        currentCell.Borders(xlEdgeTop).Weight = xlMedium
+        currentCell.Borders(xlEdgeLeft).Weight = xlMedium
+        currentCell.Borders(xlEdgeBottom).Weight = xlMedium
+        currentCell.Borders(xlEdgeRight).Weight = xlMedium
+
+        Exit Sub
+
+    End If
+
+    '=========================================================
+    ' TRAPS - KEEP EXISTING VISIBILITY RULES
+    '=========================================================
+    If symbol = "X" Then
+
+        Select Case currentLevel
+
+            Case 1
+
+                currentCell.value = WorldCupSymbol("TRAP")
+                currentCell.Interior.Color = RGB(255, 170, 170)
+                currentCell.Font.Color = RGB(150, 0, 0)
+
+            Case 2
+
+                currentCell.value = WorldCupSymbol("TRAP")
+                currentCell.Interior.Color = RGB(225, 210, 180)
+                currentCell.Font.Color = RGB(120, 80, 40)
+
+            Case 3, 4, 5
+
+                currentCell.value = ""
+                currentCell.Interior.Color = RGB(75, 145, 70)
+
+        End Select
+
+        currentCell.Borders(xlEdgeTop).Color = RGB(125, 185, 115)
+        currentCell.Borders(xlEdgeLeft).Color = RGB(125, 185, 115)
+        currentCell.Borders(xlEdgeBottom).Color = RGB(45, 95, 42)
+        currentCell.Borders(xlEdgeRight).Color = RGB(45, 95, 42)
+
+        Exit Sub
+
+    End If
+
+End Sub
+
+'=========================================================
+' DRAW PLAYER
+'=========================================================
+
+Private Sub DrawPlayer()
+
+    Dim ws As Worksheet
+    Dim playerCell As Range
+
+    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
+
+    Set playerCell = ws.Cells(playerRow, playerCol)
+
+    playerCell.value = WorldCupSymbol("PLAYER")
+
+    playerCell.HorizontalAlignment = xlCenter
+    playerCell.VerticalAlignment = xlCenter
+
+    playerCell.Font.Bold = True
+    playerCell.Font.Size = 18
+    playerCell.Font.Name = "Segoe UI Emoji"
+
+    playerCell.Font.Color = RGB(255, 255, 255)
+
+    '3D-style player tile
+    playerCell.Interior.Color = RGB(20, 90, 180)
+
+    playerCell.Borders.LineStyle = xlContinuous
+    playerCell.Borders(xlEdgeTop).Color = RGB(120, 190, 255)
+    playerCell.Borders(xlEdgeLeft).Color = RGB(120, 190, 255)
+    playerCell.Borders(xlEdgeBottom).Color = RGB(5, 35, 90)
+    playerCell.Borders(xlEdgeRight).Color = RGB(5, 35, 90)
+    playerCell.Borders(xlEdgeTop).Weight = xlMedium
+    playerCell.Borders(xlEdgeLeft).Weight = xlMedium
+    playerCell.Borders(xlEdgeBottom).Weight = xlMedium
+    playerCell.Borders(xlEdgeRight).Weight = xlMedium
+
+End Sub
+
+'=========================================================
+' ARROW KEY CONTROLS
+'=========================================================
+
+Public Sub MoveUp()
+
+    MovePlayer -1, 0
+
+End Sub
+
+
+Public Sub MoveDown()
+
+    MovePlayer 1, 0
+
+End Sub
+
+
+Public Sub MoveLeft()
+
+    MovePlayer 0, -1
+
+End Sub
+
+
+Public Sub MoveRight()
+
+    MovePlayer 0, 1
+
+End Sub
+
+'=========================================================
+' CONNECT ARROW KEYS
+'=========================================================
+
+Private Sub BindArrowKeys()
+
+    Application.OnKey "{UP}", _
+        "'" & ThisWorkbook.Name & "'!MoveUp"
+
+    Application.OnKey "{DOWN}", _
+        "'" & ThisWorkbook.Name & "'!MoveDown"
+
+    Application.OnKey "{LEFT}", _
+        "'" & ThisWorkbook.Name & "'!MoveLeft"
+
+    Application.OnKey "{RIGHT}", _
+        "'" & ThisWorkbook.Name & "'!MoveRight"
+
+    'M toggles the stadium music on / off during play.
+    Application.OnKey "m", _
+        "'" & ThisWorkbook.Name & "'!ToggleMusic"
+
+End Sub
+
+'=========================================================
+' RESTORE ARROW KEYS
+'=========================================================
+
+Private Sub UnbindArrowKeys()
+
+    On Error Resume Next
+
+    Application.OnKey "{UP}"
+    Application.OnKey "{DOWN}"
+    Application.OnKey "{LEFT}"
+    Application.OnKey "{RIGHT}"
+    Application.OnKey "m"
+
+    On Error GoTo 0
+
+End Sub
+
+'=========================================================
+' MOVE PLAYER
+'=========================================================
+
+Private Sub MovePlayer( _
+    ByVal rowChange As Long, _
+    ByVal columnChange As Long)
+
+    Dim newRow As Long
+    Dim newCol As Long
+
+    Dim oldGridRow As Long
+    Dim oldGridCol As Long
+
+    Dim newGridRow As Long
+    Dim newGridCol As Long
+
+    Dim target As String
+
+    If gameRunning = False Then Exit Sub
+
+    If gamePaused = True Then Exit Sub
+
+    newRow = playerRow + rowChange
+    newCol = playerCol + columnChange
+
+    newGridRow = newRow - MAZE_TOP
+    newGridCol = newCol - MAZE_LEFT
+
+    If newGridRow < 0 Then Exit Sub
+
+    If newGridRow >= currentMazeSize Then Exit Sub
+
+    If newGridCol < 0 Then Exit Sub
+
+    If newGridCol >= currentMazeSize Then Exit Sub
+
+    target = mazeData(newGridRow, newGridCol)
+
+    'Speed optimisation: redraw the worksheet only once per move.
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+
+    '=========================================================
+    ' DEFENDER / WALL
+    '=========================================================
+    If target = "#" Then
+
+        lives = lives - 1
+
+        score = score - LifeLossPoints()
+
+        If score < 0 Then score = 0
+
+        UpdateDashboard
+
+        Application.Calculation = xlCalculationAutomatic
+        Application.EnableEvents = True
+        Application.ScreenUpdating = True
+
+        PlayWallSound
+
+        FlashLivesBar
+
+        SetStatus _
+            "DEFENDER STOPPED YOU!  LIVES: " & lives
+
+        If lives <= 0 Then
+
+            GameOver
+
+        End If
+
+        Exit Sub
+
+    End If
+
+    '=========================================================
+    ' REMOVE OLD PLAYER
+    '=========================================================
+    oldGridRow = playerRow - MAZE_TOP
+    oldGridCol = playerCol - MAZE_LEFT
+
+    DrawMazeCell _
+        oldGridRow, _
+        oldGridCol, _
+        mazeData(oldGridRow, oldGridCol)
+
+    '=========================================================
+    ' MOVE
+    '=========================================================
+    playerRow = newRow
+    playerCol = newCol
+
+    '=========================================================
+    ' GOAL
+    '=========================================================
+    If target = "G" Then
+
+        score = score + GoalValue()
+
+        goalsCollected = goalsCollected + 1
+
+        mazeData(newGridRow, newGridCol) = "."
+
+    End If
+
+    '=========================================================
+    ' TRAP
+    '=========================================================
+    If target = "X" Then
+
+        lives = lives - 1
+
+        score = score - LifeLossPoints()
+
+        If score < 0 Then score = 0
+
+        mazeData(newGridRow, newGridCol) = "."
+
+    End If
+
+    '=========================================================
+    ' WORLD CUP TROPHY
+    '=========================================================
+    If target = "E" Then
+
+        DrawPlayer
+
+        UpdateDashboard
+
+        Application.Calculation = xlCalculationAutomatic
+        Application.EnableEvents = True
+        Application.ScreenUpdating = True
+
+        WinLevel
+
+        Exit Sub
+
+    End If
+
+    DrawPlayer
+
+    'SPEED: the dashboard is only refreshed when the score
+    'or lives actually changed - plain moves stay instant.
+    If target = "G" Or target = "X" Then
+
+        UpdateDashboard
+
+    End If
+
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+
+    If target = "G" Then
+
+        SetStatus _
+            "GOAL!  +" & GoalValue() & " POINTS"
+
+        PlayGoalSound
+
+    End If
+
+    If target = "X" Then
+
+        PlayTrapSound
+
+        FlashLivesBar
+
+        SetStatus _
+            "TRAP!  LIVES REMAINING: " & lives
+
+    End If
+
+    If lives <= 0 Then
+
+        GameOver
+
+    End If
+
+End Sub
+
+
+Private Function LifeLossPoints() As Long
+
+    Select Case currentLevel
+
+        Case 1
+            LifeLossPoints = LIFE_LOSS_LEVEL_1
+
+        Case 2
+            LifeLossPoints = LIFE_LOSS_LEVEL_2
+
+        Case 3
+            LifeLossPoints = LIFE_LOSS_LEVEL_3
+
+        Case 4
+            LifeLossPoints = LIFE_LOSS_LEVEL_4
+
+        Case 5
+            LifeLossPoints = LIFE_LOSS_LEVEL_5
+
+        Case Else
+            LifeLossPoints = LIFE_LOSS_LEVEL_1
+
+    End Select
+
+End Function
+
+
+Private Sub FlashLivesBar()
+
+    Dim ws As Worksheet
+    Dim i As Long
+    Dim flashStart As Double
+
+    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
+
+    For i = 1 To 3
+
+        ws.Range("AA9:AB9").Interior.Color = RGB(255, 0, 0)
+        ws.Range("AA9:AB9").Font.Color = RGB(255, 255, 255)
+
+        flashStart = Timer
+
+        Do While Timer - flashStart < 0.15
+            DoEvents
+        Loop
+
+        ws.Range("AA9:AB9").Interior.Color = RGB(255, 220, 220)
+        ws.Range("AA9:AB9").Font.Color = RGB(120, 0, 0)
+
+        flashStart = Timer
+
+        Do While Timer - flashStart < 0.15
+            DoEvents
+        Loop
+
+    Next i
+
+    ws.Range("AA9:AB9").Interior.Color = RGB(255, 220, 220)
+    ws.Range("AA9:AB9").Font.Color = RGB(120, 0, 0)
+
+End Sub
+
+'=========================================================
+' STAGE NAME
+'=========================================================
+
+Private Function StageName() As String
+
+    Select Case currentLevel
+
+        Case 1
+            StageName = "Group Stage"
+
+        Case 2
+            StageName = "Round of 16"
+
+        Case 3
+            StageName = "Quarter-Final"
+
+        Case 4
+            StageName = "Semi-Final"
+
+        Case 5
+            StageName = "World Cup Final"
+
+        Case Else
+            StageName = "Tournament"
+
+    End Select
+
+End Function
+
+'=========================================================
+' DIFFICULTY
+'=========================================================
+
+Private Function DifficultyName() As String
+
+    Select Case currentLevel
+
+        Case 1
+            DifficultyName = "Easy"
+
+        Case 2
+            DifficultyName = "Medium"
+
+        Case 3
+            DifficultyName = "Medium-Hard"
+
+        Case 4
+            DifficultyName = "Hard"
+
+        Case 5
+            DifficultyName = "Expert"
+
+        Case Else
+            DifficultyName = "Unknown"
+
+    End Select
+
+End Function
+
+'=========================================================
+' MAZE SIZE
+'=========================================================
+
+Private Function MazeSizeForLevel() As Long
+
+    Select Case currentLevel
+
+        Case 1
+            MazeSizeForLevel = 11
+
+        Case 2
+            MazeSizeForLevel = 13
+
+        Case 3
+            MazeSizeForLevel = 15
+
+        Case 4
+            MazeSizeForLevel = 19
+
+        Case 5
+            MazeSizeForLevel = 23
+
+        Case Else
+            MazeSizeForLevel = 11
+
+    End Select
+
+End Function
+
+'=========================================================
+' LIVES
+'=========================================================
+
+Private Function LivesForLevel() As Long
+
+    'Every level starts with 3 lives
+    LivesForLevel = 3
+
+End Function
+
+'=========================================================
+' EXTRA ROUTES
+'=========================================================
+
+Private Function ExtraRouteCount() As Long
+
+    Select Case currentLevel
+
+        Case 1
+            ExtraRouteCount = 2
+
+        Case 2
+            ExtraRouteCount = 4
+
+        Case 3
+            ExtraRouteCount = 7
+
+        Case 4
+            ExtraRouteCount = 12
+
+        Case 5
+            ExtraRouteCount = 18
+
+        Case Else
+            ExtraRouteCount = 2
+
+    End Select
+
+End Function
+
+'=========================================================
+' TRAP COUNT
+'=========================================================
+
+Private Function TrapCountForLevel() As Long
+
+    Select Case currentLevel
+
+        Case 1
+            TrapCountForLevel = 2
+
+        Case 2
+            TrapCountForLevel = 4
+
+        Case 3
+            TrapCountForLevel = 7
+
+        Case 4
+            TrapCountForLevel = 12
+
+        Case 5
+            TrapCountForLevel = 20
+
+        Case Else
+            TrapCountForLevel = 2
+
+    End Select
+
+End Function
+
+'=========================================================
+' GOAL COUNT
+'=========================================================
+
+Private Function GoalCountForLevel() As Long
+
+    Select Case currentLevel
+
+        Case 1
+            GoalCountForLevel = 3
+
+        Case 2
+            GoalCountForLevel = 5
+
+        Case 3
+            GoalCountForLevel = 7
+
+        Case 4
+            GoalCountForLevel = 9
+
+        Case 5
+            GoalCountForLevel = 12
+
+        Case Else
+            GoalCountForLevel = 3
+
+    End Select
+
+End Function
+
+'=========================================================
+' GOAL VALUE
+'=========================================================
+
+Private Function GoalValue() As Long
+
+    GoalValue = 10 + ((currentLevel - 1) * 5)
+
+End Function
+
+'=========================================================
+' WORLD CUP STADIUM BACKGROUND
+'
+' Replaces the plain white sheet with a dark, mowed-pitch
+' stripe pattern behind every screen in the game.
+'=========================================================
+
+Private Sub PaintStadiumBackground(ByVal ws As Worksheet)
+
+    Dim bgRow As Long
+
+    'Base stadium green across the entire sheet.
+    ws.Cells.Interior.Color = RGB(21, 68, 41)
+
+    'Mowed-pitch stripes for a World Cup stadium look.
+    For bgRow = 1 To 120
+
+        If ((bgRow - 1) \ 4) Mod 2 = 0 Then
+
+            ws.Rows(bgRow).Interior.Color = RGB(27, 84, 50)
+
+        Else
+
+            ws.Rows(bgRow).Interior.Color = RGB(16, 53, 32)
+
+        End If
+
+    Next bgRow
+
+End Sub
+
+
+Private Sub RestoreHighScoreFills(ByVal ws As Worksheet)
+
+    'The stadium background paint resets every cell fill,
+    'so the high score table colours are re-applied here
+    'to keep the table displaying correctly.
+
+    ws.Range("AD1:AI1").Interior.Color = RGB(15, 35, 60)
+    ws.Range("AD2:AI2").Interior.Color = RGB(35, 75, 55)
+    ws.Range("AD3:AI12").Interior.Color = RGB(248, 250, 252)
+
+    ws.Range("AD3:AI3").Interior.Color = RGB(255, 235, 150)
+    ws.Range("AD4:AI4").Interior.Color = RGB(225, 230, 235)
+    ws.Range("AD5:AI5").Interior.Color = RGB(235, 215, 190)
+
+End Sub
+
+'=========================================================
+' PROFESSIONAL DASHBOARD
+'=========================================================
+
+Private Sub SetupDashboard()
+
+    Dim ws As Worksheet
+
+    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
+
+    '=========================================================
+    ' REMOVE OLD MERGES
+    '=========================================================
+
+    On Error Resume Next
+
+    ws.Range("B1:X2").UnMerge
+    ws.Range("B3:X3").UnMerge
+    ws.Range("AA1:AB1").UnMerge
+    ws.Range("AA13:AB13").UnMerge
+    ws.Range("AA19:AB19").UnMerge
+
+    On Error GoTo 0
+
+    '=========================================================
+    ' CLEAR DASHBOARD
+    '=========================================================
+
+    ws.Range("B1:X3").Clear
+    ws.Range("AA1:AB24").Clear
+
+    'World Cup themed stadium background instead of a
+    'white sheet.
+    PaintStadiumBackground ws
+
+    'Keep the high score table styled correctly.
+    RestoreHighScoreFills ws
+
+    '=========================================================
+    ' MAIN WORLD CUP TITLE
+    '=========================================================
+
+    With ws.Range("B1:X2")
+
+        .Merge
+
+        .value = _
+            WorldCupSymbol("TROPHY") & _
+            "  FIFA WORLD CUP 2026 - ESCAPE  " & _
+            WorldCupSymbol("TROPHY")
+
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+
+        .Font.Name = "Segoe UI Emoji"
+        .Font.Bold = True
+        .Font.Size = 24
+
+        .Font.Color = RGB(255, 215, 0)
+
+        .Interior.Color = RGB(15, 35, 60)
+
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(255, 215, 0)
+        .Borders.Weight = xlMedium
+
+    End With
+
+    '=========================================================
+    ' SUBTITLE / STAGE BAR
+    '=========================================================
+
+    With ws.Range("B3:X3")
+
+        .Merge
+
+        .value = _
+            "THE ROAD TO GLORY  |  WORLD CUP ESCAPE"
+
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+
+        .Font.Bold = True
+        .Font.Size = 11
+
+        .Font.Color = RGB(255, 255, 255)
+
+        .Interior.Color = RGB(35, 75, 55)
+
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(255, 255, 255)
+
+    End With
+
+    '=========================================================
+    ' MATCH CENTRE TITLE
+    '=========================================================
+
+    With ws.Range("AA1:AB1")
+
+        .Merge
+
+        .value = "MATCH CENTRE"
+
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+
+        .Font.Bold = True
+        .Font.Size = 20
+
+        .Font.Color = RGB(255, 215, 0)
+
+        .Interior.Color = RGB(15, 35, 60)
+
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(255, 215, 0)
+        .Borders.Weight = xlMedium
+
+    End With
+
+    '=========================================================
+    ' DASHBOARD LABELS
+    '=========================================================
+
+    ws.Range("AA2").value = "TEAM"
+    ws.Range("AA3").value = "STAGE"
+    ws.Range("AA4").value = "LEVEL"
+    ws.Range("AA5").value = "DIFFICULTY"
+    ws.Range("AA6").value = "MAZE SIZE"
+
+    ws.Range("AA7").value = "SCORE"
+    ws.Range("AA8").value = "GOALS"
+    ws.Range("AA9").value = "LIVES"
+    ws.Range("AA10").value = "TIME"
+    ws.Range("AA11").value = "STATUS"
+    ws.Range("AA12").value = "LEVEL TIME"
+
+    '=========================================================
+    ' LABEL STYLE
+    '=========================================================
+
+    With ws.Range("AA2:AA12")
+
+        .Font.Bold = True
+        .Font.Size = 12
+        .Font.Color = RGB(255, 255, 255)
+
+        .Interior.Color = RGB(35, 45, 60)
+
+        .HorizontalAlignment = xlLeft
+        .VerticalAlignment = xlCenter
+
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(180, 190, 200)
+
+    End With
+
+    '=========================================================
+    ' VALUE STYLE
+    '=========================================================
+
+    With ws.Range("AB2:AB12")
+
+        .Font.Bold = True
+        .Font.Size = 14
+        .Font.Color = RGB(15, 35, 60)
+
+        .Interior.Color = RGB(245, 247, 250)
+
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(180, 190, 200)
+
+    End With
+
+    ws.Range("AB2").Font.Name = "Segoe UI Emoji"
+    ws.Range("AB2").Font.Size = 13
+    ws.Range("AB2").HorizontalAlignment = xlLeft
+    ws.Range("AB2").WrapText = True
+
+    '=========================================================
+    ' SCORE PANEL
+    '=========================================================
+
+    With ws.Range("AA7:AB7")
+
+        .Interior.Color = RGB(255, 215, 0)
+
+    End With
+
+    ws.Range("AA7").Font.Color = RGB(15, 35, 60)
+    ws.Range("AB7").Font.Color = RGB(15, 35, 60)
+    ws.Range("AB7").Font.Size = 18
+
+    '=========================================================
+    ' GOALS / LIVES / TIME / STATUS
+    '=========================================================
+
+    ws.Range("AA8:AA12").Font.Size = 12
+    ws.Range("AA8:AA12").Font.Bold = True
+    ws.Range("AA8:AA12").Font.Color = RGB(255, 255, 255)
+    ws.Range("AA8:AA12").Interior.Color = RGB(35, 45, 60)
+    ws.Range("AA8:AA12").HorizontalAlignment = xlLeft
+    ws.Range("AA8:AA12").VerticalAlignment = xlCenter
+    ws.Range("AA8:AA12").Borders.LineStyle = xlContinuous
+    ws.Range("AA8:AA12").Borders.Color = RGB(180, 190, 200)
+
+    ws.Range("AB8:AB12").Font.Size = 14
+    ws.Range("AB8:AB12").Font.Bold = True
+    ws.Range("AB8:AB12").Font.Color = RGB(15, 35, 60)
+    ws.Range("AB8:AB12").Interior.Color = RGB(245, 247, 250)
+    ws.Range("AB8:AB12").HorizontalAlignment = xlCenter
+    ws.Range("AB8:AB12").VerticalAlignment = xlCenter
+    ws.Range("AB8:AB12").Borders.LineStyle = xlContinuous
+    ws.Range("AB8:AB12").Borders.Color = RGB(180, 190, 200)
+    ws.Range("AB11").WrapText = True
+
+    '=========================================================
+    ' CONTROLS HEADER
+    '=========================================================
+
+    With ws.Range("AA13:AB13")
+
+        .Merge
+
+        .value = "CONTROLS"
+
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+
+        .Font.Bold = True
+        .Font.Size = 16
+
+        .Font.Color = RGB(255, 215, 0)
+
+        .Interior.Color = RGB(15, 35, 60)
+
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(255, 215, 0)
+
+    End With
+
+    '=========================================================
+    ' CONTROLS
+    '=========================================================
+
+    ws.Range("AA14").value = ChrW(8593)
+    ws.Range("AB14").value = "Move Up"
+
+    ws.Range("AA15").value = ChrW(8595)
+    ws.Range("AB15").value = "Move Down"
+
+    ws.Range("AA16").value = ChrW(8592)
+    ws.Range("AB16").value = "Move Left"
+
+    ws.Range("AA17").value = ChrW(8594)
+    ws.Range("AB17").value = "Move Right"
+
+    ws.Range("AA18").value = ChrW(9834)
+    ws.Range("AB18").value = "Music On/Off (M)"
+
+    With ws.Range("AA14:AA18")
+
+        .Font.Name = "Segoe UI Symbol"
+        .Font.Bold = True
+        .Font.Size = 22
+
+        .Font.Color = RGB(15, 35, 60)
+
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+
+        .Interior.Color = RGB(235, 240, 245)
+
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(200, 205, 210)
+
+    End With
+
+    With ws.Range("AB14:AB18")
+
+        .Font.Bold = True
+        .Font.Size = 13
+
+        .Font.Color = RGB(15, 35, 60)
+
+        .HorizontalAlignment = xlLeft
+        .VerticalAlignment = xlCenter
+
+        .Interior.Color = RGB(245, 247, 250)
+
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(200, 205, 210)
+
+    End With
+
+    '=========================================================
+    ' LEGEND HEADER
+    '=========================================================
+
+    With ws.Range("AA19:AB19")
+
+        .Merge
+
+        .value = "LEGEND"
+
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+
+        .Font.Bold = True
+        .Font.Size = 16
+
+        .Font.Color = RGB(255, 215, 0)
+
+        .Interior.Color = RGB(15, 35, 60)
+
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(255, 215, 0)
+
+    End With
+
+    '=========================================================
+    ' LEGEND
+    '=========================================================
+
+    ws.Range("AA20").value = WorldCupSymbol("PLAYER")
+    ws.Range("AB20").value = "Player"
+
+    ws.Range("AA21").value = WorldCupSymbol("DEFENDER")
+    ws.Range("AB21").value = "Defender"
+
+    ws.Range("AA22").value = WorldCupSymbol("GOAL")
+    ws.Range("AB22").value = "Goal"
+
+    ws.Range("AA23").value = WorldCupSymbol("TRAP")
+    ws.Range("AB23").value = "Trap"
+
+    ws.Range("AA24").value = WorldCupSymbol("TROPHY")
+    ws.Range("AB24").value = "World Cup Trophy"
+
+    With ws.Range("AA20:AA24")
+
+        .Font.Name = "Segoe UI Emoji"
+        .Font.Size = 20
+        .Font.Bold = True
+
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+
+        .Interior.Color = RGB(245, 247, 250)
+
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(200, 205, 210)
+
+    End With
+
+    With ws.Range("AB20:AB24")
+
+        .Font.Bold = True
+        .Font.Size = 13
+
+        .Font.Color = RGB(15, 35, 60)
+
+        .HorizontalAlignment = xlLeft
+        .VerticalAlignment = xlCenter
+
+        .Interior.Color = RGB(245, 247, 250)
+
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(200, 205, 210)
+
+    End With
+
+    '=========================================================
+    ' COLUMN WIDTHS
+    '=========================================================
+
+    ws.Columns("AA").ColumnWidth = 26
+    ws.Columns("AB").ColumnWidth = 38
+    ws.Columns("AC").ColumnWidth = 4
+
+    '=========================================================
+    ' ROW HEIGHTS
+    '=========================================================
+
+    ws.Rows("1:2").RowHeight = 36
+    ws.Rows("3:3").RowHeight = 28
+
+    ws.Rows("4:12").RowHeight = 30
+    ws.Rows("13:13").RowHeight = 30
+    ws.Rows("19:19").RowHeight = 30
+
+    ws.Rows("14:18").RowHeight = 32
+    ws.Rows("20:24").RowHeight = 32
+
+    '=========================================================
+    ' MAIN PITCH WIDTH
+    '=========================================================
+
+    ws.Columns("B:X").ColumnWidth = 3.2
+
+End Sub
+
+'=========================================================
+' UPDATE DASHBOARD
+'=========================================================
+
+Private Sub UpdateDashboard()
+
+    Dim ws As Worksheet
+    Dim stageKey As String
+
+    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
+
+    '=========================================================
+    ' SPEED: static cells (stage bar, stage name, level,
+    ' difficulty, maze size, team) are only rewritten when
+    ' the stage changes, so every move stays smooth.
+    '=========================================================
+
+    stageKey = currentLevel & "|" & currentMazeSize
+
+    If stageKey <> lastStageKey Then
+
+        '=====================================================
+        ' UPDATE MAIN STAGE BAR
+        '=====================================================
+
+        ws.Range("B3").value = _
+            "THE ROAD TO GLORY | " & _
+            UCase(StageName()) & _
+            " | LEVEL " & _
+            currentLevel & _
+            " | " & _
+            UCase(DifficultyName())
+
+        '=====================================================
+        ' UPDATE MATCH CENTRE
+        '=====================================================
+
+        'Extra indent spaces keep the team name clear of the
+        'flag graphic drawn on top of this cell.
+        ws.Range("AB2").value = _
+            "           " & selectedTeam
+
+        ws.Range("AB3").value = StageName()
+
+        ws.Range("AB4").value = currentLevel
+
+        ws.Range("AB5").value = DifficultyName()
+
+        ws.Range("AB6").value = _
+            currentMazeSize & " x " & currentMazeSize
+
+        lastStageKey = stageKey
+
+    End If
+
+    '=========================================================
+    ' UPDATE LIVE VALUES
+    '=========================================================
+
+    ws.Range("AB7").value = score
+
+    ws.Range("AB8").value = goalsCollected
+
+    ws.Range("AB9").value = lives
+
+    ws.Range("AB12").value = FormatGameTime(LevelTimeRemaining())
+
+End Sub
+
+'=========================================================
+' STATUS
+'=========================================================
+
+Private Sub SetStatus(ByVal message As String)
+
+    Dim ws As Worksheet
+
+    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
+
+    ws.Range("AB11").value = message
+
+End Sub
+
+'=========================================================
+' TIMER
+'=========================================================
+
+Private Function LevelTimeRemaining() As Long
+
+    Dim elapsedLevelSeconds As Long
+
+    elapsedLevelSeconds = GetElapsedSeconds() - levelStartElapsedSeconds
+
+    LevelTimeRemaining = LEVEL_TIME_LIMIT - elapsedLevelSeconds
+
+    If LevelTimeRemaining < 0 Then
+        LevelTimeRemaining = 0
+    End If
+
+End Function
+
+
+Public Sub UpdateTimer()
+
+    Dim secondsPassed As Long
+
+    nextTickScheduled = False
+
+    If gameRunning = False Then Exit Sub
+
+    If gamePaused = True Then Exit Sub
+
+    secondsPassed = GetElapsedSeconds()
+
+    'Speed optimisation: write the timer cells directly
+    'without toggling the screen repaint.
+    ThisWorkbook.Worksheets(SHEET_NAME) _
+        .Range("AB10").value = _
+        FormatGameTime(secondsPassed)
+
+    ThisWorkbook.Worksheets(SHEET_NAME) _
+        .Range("AB12").value = _
+        FormatGameTime(LevelTimeRemaining())
+
+    If LevelTimeRemaining() <= 0 Then
+
+        SetStatus "TIME UP!"
+
+        GameOver
+
+        Exit Sub
+
+    End If
+
+    nextTick = Now + TimeSerial(0, 0, 1)
+
+    Application.OnTime _
+        EarliestTime:=nextTick, _
+        Procedure:=TimerProcedureName(), _
+        Schedule:=True
+
+    nextTickScheduled = True
+
+End Sub
+
+'=========================================================
+' ELAPSED TIME
+'=========================================================
+
+Private Function GetElapsedSeconds() As Long
+
+    Dim secondsPassed As Double
+
+    If gamePaused = True Then
+
+        secondsPassed = _
+            (pauseStarted - gameStart) * 86400 _
+            - totalPausedSeconds
+
+    Else
+
+        secondsPassed = _
+            (Now - gameStart) * 86400 _
+            - totalPausedSeconds
+
+    End If
+
+    If secondsPassed < 0 Then
+
+        secondsPassed = 0
+
+    End If
+
+    GetElapsedSeconds = CLng(secondsPassed)
+
+End Function
+
+'=========================================================
+' FORMAT TIME
+'=========================================================
+
+Private Function FormatGameTime( _
+    ByVal totalSeconds As Long) As String
+
+    Dim minutes As Long
+    Dim seconds As Long
+
+    minutes = totalSeconds \ 60
+
+    seconds = totalSeconds Mod 60
+
+    FormatGameTime = _
+        Format(minutes, "00") & ":" & _
+        Format(seconds, "00")
+
+End Function
+
+'=========================================================
+' MUSIC ENGINE - CHILLED STADIUM THEME
+'
+' Three relaxed, football-themed songs are generated as
+' WAV files and played through Windows MCI:
+'
+'   Track 1 "Stadium Chill"     - the original soft groove.
+'   Track 2 "Samba Breeze"      - bright bossa with
+'                                 syncopated off-beat bass
+'                                 and marimba-style plucks.
+'   Track 3 "Champion's Anthem" - upbeat but relaxed
+'                                 stadium-anthem groove in
+'                                 C major with a bold,
+'                                 rising melody.
+'
+' SHUFFLE: when a track finishes, a random DIFFERENT
+' track starts automatically, so the music stays fresh.
+'
+' Press M during play, or run the ToggleMusic macro, to
+' switch the music on or off.
+'=========================================================
+
+Public Sub StartMusic()
+
+    If musicOn = False Then Exit Sub
+
+    InitAudio
+
+    If audioReady = False Then Exit Sub
+
+    If currentMusicTrack < 1 Or currentMusicTrack > 3 Then
+        currentMusicTrack = 1
+    End If
+
+    If musicPlaying = False Then
+
+        PlayMusicTrack currentMusicTrack
+
+    End If
+
+    StartMusicTimer
+
+End Sub
+
+
+Public Sub StopMusic()
+
+    Dim i As Long
+
+    musicPlaying = False
+
+    StopMusicTimer
+
+    For i = 1 To 3
+
+        MciExec "stop WCMusic" & CStr(i)
+
+    Next i
+
+End Sub
+
+
+'Run this macro (or press M during play) to switch the
+'music on / off.
+Public Sub ToggleMusic()
+
+    musicOn = Not musicOn
+
+    If musicOn Then
+
+        If gamePaused = False Then StartMusic
+
+        If gameRunning = True And gamePaused = False Then
+            SetStatus "MUSIC ON"
+        End If
+
+    Else
+
+        StopMusic
+
+        If gameRunning = True And gamePaused = False Then
+            SetStatus "MUSIC OFF"
+        End If
+
+    End If
+
+End Sub
+
+
+Private Sub PlayMusicTrack(ByVal trackNo As Long)
+
+    Dim i As Long
+
+    'Make sure no other track is still playing.
+    For i = 1 To 3
+
+        MciExec "stop WCMusic" & CStr(i)
+
+    Next i
+
+    MciExec "seek WCMusic" & CStr(trackNo) & " to start"
+    MciExec "play WCMusic" & CStr(trackNo)
+
+    musicPlaying = True
+
+End Sub
+
+
+Private Sub StartMusicTimer()
+
+    If hMusicTimer <> 0 Then Exit Sub
+
+    On Error Resume Next
+
+    hMusicTimer = SetTimer(0, MUSIC_TIMER_ID, MUSIC_TICK_MS, AddressOf MusicTimerProc)
+
+    On Error GoTo 0
+
+End Sub
+
+
+Private Sub StopMusicTimer()
+
+    If hMusicTimer <> 0 Then
+
+        On Error Resume Next
+
+        KillTimer 0, hMusicTimer
+
+        On Error GoTo 0
+
+        hMusicTimer = 0
+
+    End If
+
+End Sub
+
+
+#If VBA7 Then
+Private Sub MusicTimerProc( _
+    ByVal hWnd As LongPtr, _
+    ByVal uMsg As Long, _
+    ByVal nIDEvent As LongPtr, _
+    ByVal dwTime As Long)
+#Else
+Private Sub MusicTimerProc( _
+    ByVal hWnd As Long, _
+    ByVal uMsg As Long, _
+    ByVal nIDEvent As Long, _
+    ByVal dwTime As Long)
+#End If
+
+    'Errors must never escape a timer callback.
+    On Error Resume Next
+
+    KeepMusicLoop
+
+End Sub
+
+
+Private Sub KeepMusicLoop()
+
+    'SHUFFLE: when the current track has finished, a random
+    'DIFFERENT track starts, so any of the three songs can
+    'play next and none repeats back to back.
+
+    Dim modeText As String
+    Dim offset As Long
+    Dim newTrack As Long
+
+    If musicBusy Then Exit Sub
+    If musicPlaying = False Then Exit Sub
+
+    musicBusy = True
+
+    modeText = MciQuery("status WCMusic" & CStr(currentMusicTrack) & " mode")
+
+    If Len(modeText) = 0 _
+        Or InStr(1, modeText, "playing", vbTextCompare) = 0 Then
+
+        'Pick randomly from the other two tracks.
+        offset = Int(Rnd * 2)   '0 or 1
+
+        newTrack = currentMusicTrack + offset + 1
+
+        If newTrack > 3 Then newTrack = newTrack - 3
+
+        currentMusicTrack = newTrack
+
+        PlayMusicTrack currentMusicTrack
+
+    End If
+
+    musicBusy = False
+
+End Sub
+
+
+Private Sub LoadMusicTune(ByVal trackNo As Long)
+
+    Select Case trackNo
+
+        Case 2
+            'Track 2 - "Samba Breeze": bright bossa feel in
+            'D minor, syncopated off-beat bass, snappy
+            'marimba-style plucks, active shaker.
+            musicStepSec = 0.21
+            musicMelody = Array( _
+                74, 0, 77, 0, 81, 0, 79, 77, _
+                74, 0, 70, 0, 74, 0, 72, 0, _
+                73, 0, 76, 0, 81, 0, 79, 0, _
+                77, 0, 74, 0, 72, 0, 0, 0)
+            musicNoteLen = 0.22
+            musicNoteDecay = 6#
+            musicTone2Ratio = 3.9
+            musicTone2Amp = 0.3
+            musicBass = Array(38, 38, 43, 43, 45, 45, 38, 38)
+            musicBassSteps = "00100010"
+            musicBassDecay = 5#
+            musicChords = Array( _
+                Array(293.66, 349.23, 440#), _
+                Array(233.08, 293.66, 349.23), _
+                Array(220#, 277.18, 329.63), _
+                Array(293.66, 349.23, 440#))
+            musicPadAttack = 0.2
+            musicKickSteps = "10000100"
+            musicShakerSteps = "10101010"
+            musicCrowdAmp = 1.2
+
+        Case 3
+            'Track 3 - "Champion's Anthem": upbeat but relaxed
+            'stadium-anthemic groove in C major
+            '(C - G - Am - F) with a bold rising melody and a
+            'light marching pulse.
+            musicStepSec = 0.22
+            musicMelody = Array( _
+                72, 0, 76, 79, 0, 76, 0, 72, _
+                74, 0, 77, 81, 0, 77, 0, 74, _
+                76, 0, 79, 84, 0, 79, 0, 76, _
+                79, 0, 76, 74, 0, 72, 0, 0)
+            musicNoteLen = 0.35
+            musicNoteDecay = 3.5
+            musicTone2Ratio = 2#
+            musicTone2Amp = 0.25
+            musicBass = Array(36, 36, 43, 43, 45, 45, 41, 41)
+            musicBassSteps = "10001000"
+            musicBassDecay = 6#
+            musicChords = Array( _
+                Array(261.63, 329.63, 392#), _
+                Array(196#, 246.94, 293.66), _
+                Array(220#, 261.63, 329.63), _
+                Array(174.61, 220#, 261.63))
+            musicPadAttack = 0.25
+            musicKickSteps = "10000010"
+            musicShakerSteps = "00100010"
+            musicCrowdAmp = 1.4
+
+        Case Else
+            'Track 1 - "Stadium Chill": the original theme
+            'in A minor (Am - F - C - G).
+            musicStepSec = 0.26
+            musicMelody = Array( _
+                69, 0, 72, 0, 76, 0, 72, 0, _
+                65, 0, 69, 0, 72, 0, 69, 0, _
+                64, 0, 67, 0, 72, 0, 67, 0, _
+                62, 0, 67, 0, 71, 0, 74, 0)
+            musicNoteLen = 0.45
+            musicNoteDecay = 4#
+            musicTone2Ratio = 2#
+            musicTone2Amp = 0.3
+            musicBass = Array(45, 41, 48, 43, 45, 41, 48, 43)
+            musicBassSteps = "10001000"
+            musicBassDecay = 6.5
+            musicChords = Array( _
+                Array(220#, 261.63, 329.63), _
+                Array(174.61, 220#, 261.63), _
+                Array(261.63, 329.63, 392#), _
+                Array(196#, 246.94, 293.66))
+            musicPadAttack = 0.3
+            musicKickSteps = "10000000"
+            musicShakerSteps = "01010101"
+            musicCrowdAmp = 1.5
+
+    End Select
+
+End Sub
+
+'=========================================================
+' AUDIO GENERATION AND PLAYBACK (MCI)
+'
+' Music and sound effects are synthesised into small WAV
+' files in the temp folder (cached, so they are only
+' generated once) and played through Windows MCI.
+'=========================================================
+
+Private Sub MciExec(ByVal commandText As String)
+
+    On Error Resume Next
+
+    mciSendStringW StrPtr(commandText), 0, 0, 0
+
+    On Error GoTo 0
+
+End Sub
+
+
+Private Function MciQuery(ByVal commandText As String) As String
+
+    Dim buf As String
+
+    buf = String$(260, Chr$(0))
+
+    On Error Resume Next
+
+    mciSendStringW StrPtr(commandText), StrPtr(buf), 260, 0
+
+    On Error GoTo 0
+
+    MciQuery = Replace(buf, Chr$(0), "")
+
+End Function
+
+
+Private Function MusicTrackFile(ByVal trackNo As Long) As String
+
+    'Track file names are versioned so that updated tunes
+    'are regenerated instead of replaying an old cached
+    'file with the same name.
+
+    Dim suffix As String
+
+    suffix = ""
+
+    If trackNo = 3 Then suffix = "_v2"
+
+    MusicTrackFile = audioFolder & "\WCEscape_Track" & CStr(trackNo) & suffix & ".wav"
+
+End Function
+
+
+Private Sub InitAudio()
+
+    Dim statusText As String
+    Dim i As Long
+
+    If audioReady Then Exit Sub
+
+    audioFolder = Environ("TEMP")
+    If audioFolder = "" Then audioFolder = Environ("TMP")
+    If audioFolder = "" Then audioFolder = CurDir$()
+
+    'Close any aliases left over from an earlier session.
+    On Error Resume Next
+
+    For i = 1 To 3
+        MciExec "close WCMusic" & CStr(i)
+    Next i
+
+    MciExec "close WCGoal"
+    MciExec "close WCTrap"
+    MciExec "close WCWall"
+    MciExec "close WCWin"
+    MciExec "close WCOver"
+    MciExec "close WCClick"
+
+    On Error GoTo 0
+
+    'Music tracks: regenerate any that are missing. The
+    'file names are versioned, so updated tunes are picked
+    'up automatically on the first run.
+    For i = 1 To 3
+
+        If Len(Dir(MusicTrackFile(i))) = 0 Then
+            GenerateMusicFile i
+        End If
+
+    Next i
+
+    'Sound effects: only generated if missing (cached).
+    If Len(Dir(audioFolder & "\WCEscape_Goal.wav")) = 0 _
+        Or Len(Dir(audioFolder & "\WCEscape_Trap.wav")) = 0 _
+        Or Len(Dir(audioFolder & "\WCEscape_Wall.wav")) = 0 _
+        Or Len(Dir(audioFolder & "\WCEscape_Win.wav")) = 0 _
+        Or Len(Dir(audioFolder & "\WCEscape_Over.wav")) = 0 _
+        Or Len(Dir(audioFolder & "\WCEscape_Click.wav")) = 0 Then
+
+        GenerateSfxFiles
+
+    End If
+
+    On Error Resume Next
+
+    For i = 1 To 3
+
+        MciExec "open """ & MusicTrackFile(i) & """ alias WCMusic" & CStr(i)
+
+        'Keep the music soft under the sound effects.
+        MciExec "set WCMusic" & CStr(i) & " volume to 600"
+
+    Next i
+
+    MciExec "open """ & audioFolder & "\WCEscape_Goal.wav"" alias WCGoal"
+    MciExec "open """ & audioFolder & "\WCEscape_Trap.wav"" alias WCTrap"
+    MciExec "open """ & audioFolder & "\WCEscape_Wall.wav"" alias WCWall"
+    MciExec "open """ & audioFolder & "\WCEscape_Win.wav"" alias WCWin"
+    MciExec "open """ & audioFolder & "\WCEscape_Over.wav"" alias WCOver"
+    MciExec "open """ & audioFolder & "\WCEscape_Click.wav"" alias WCClick"
+
+    On Error GoTo 0
+
+    statusText = MciQuery("status WCMusic1 mode")
+
+    If Len(statusText) > 0 Then audioReady = True
+
+End Sub
+
+
+Private Sub PlaySfxFile(ByVal aliasName As String)
+
+    If audioReady = False Then Exit Sub
+
+    MciExec "seek " & aliasName & " to start"
+    MciExec "play " & aliasName
+
+End Sub
+
+
+Private Sub GenerateMusicFile(ByVal trackNo As Long)
+
+    Dim sampleRate As Long
+    Dim stepSec As Double
+    Dim stepsPerPass As Long
+    Dim passes As Long
+    Dim nSamples As Long
+    Dim samples() As Double
+    Dim i As Long
+    Dim t As Double
+    Dim stepIdx As Long
+    Dim patternStep As Long
+    Dim chordIdx As Long
+    Dim bassIdx As Long
+    Dim stepOf8 As Long
+    Dim chordRow As Variant
+    Dim chord1 As Double
+    Dim chord2 As Double
+    Dim chord3 As Double
+    Dim bassNote As Long
+    Dim chordLen As Double
+    Dim chordPos As Double
+    Dim env As Double
+    Dim v As Double
+    Dim melodyN As Long
+    Dim noteFreq As Double
+    Dim noteStart As Double
+    Dim notePos As Double
+    Dim bassFreq As Double
+    Dim bassPos As Double
+    Dim crowdAvg As Double
+    Dim pi2 As Double
+
+    sampleRate = 11025
+    stepsPerPass = 32
+    passes = 2
+    pi2 = 8 * Atn(1)
+
+    LoadMusicTune trackNo
+
+    stepSec = musicStepSec
+
+    nSamples = CLng(stepSec * stepsPerPass * passes * sampleRate)
+    ReDim samples(0 To nSamples - 1)
+
+    chordLen = stepSec * 8
+    crowdAvg = 0
+
+    For i = 0 To nSamples - 1
+
+        t = i / sampleRate
+
+        stepIdx = Int(t / stepSec)
+        patternStep = stepIdx Mod stepsPerPass
+        chordIdx = Int(patternStep / 8)
+        bassIdx = Int(patternStep / 4)
+        stepOf8 = (patternStep Mod 8) + 1
+
+        chordRow = musicChords(chordIdx)
+        chord1 = chordRow(0)
+        chord2 = chordRow(1)
+        chord3 = chordRow(2)
+
+        bassNote = musicBass(bassIdx)
+
+        chordPos = t - Int(t / chordLen) * chordLen
+
+        env = chordPos / musicPadAttack
+        If env > 1 Then env = 1
+        If (chordLen - chordPos) / 0.35 < env Then env = (chordLen - chordPos) / 0.35
+        If env < 0 Then env = 0
+
+        'Soft chord pads.
+        v = env * 0.05 * (Sin(pi2 * chord1 * t) _
+            + Sin(pi2 * chord2 * t) + Sin(pi2 * chord3 * t))
+
+        'Melody - the timbre differs per track (pluck,
+        'marimba, smooth lead or bell).
+        melodyN = musicMelody(patternStep)
+
+        If melodyN > 0 Then
+
+            noteStart = stepIdx * stepSec
+            notePos = t - noteStart
+
+            If notePos < musicNoteLen Then
+
+                noteFreq = 440# * 2 ^ ((melodyN - 69) / 12)
+
+                env = notePos / 0.015
+                If env > 1 Then env = 1
+                env = env * Exp(-notePos * musicNoteDecay)
+
+                v = v + env * 0.1 * (Sin(pi2 * noteFreq * t) _
+                    + musicTone2Amp * Sin(pi2 * noteFreq * musicTone2Ratio * t))
+
+            End If
+
+        End If
+
+        'Bass - the rhythm pattern differs per track.
+        If Mid$(musicBassSteps, stepOf8, 1) = "1" Then
+
+            bassPos = t - stepIdx * stepSec
+
+            If bassPos < 1.2 Then
+
+                bassFreq = 440# * 2 ^ ((bassNote - 69) / 12)
+
+                v = v + Exp(-bassPos * musicBassDecay) * 0.11 * Sin(pi2 * bassFreq * t)
+
+            End If
+
+        End If
+
+        'Kick - pattern differs per track.
+        If Mid$(musicKickSteps, stepOf8, 1) = "1" Then
+
+            bassPos = t - stepIdx * stepSec
+
+            If bassPos < 0.1 Then
+                v = v + Exp(-bassPos * 45) * 0.1 * Sin(pi2 * 60 * t)
+            End If
+
+        End If
+
+        'Shaker - pattern differs per track.
+        If Mid$(musicShakerSteps, stepOf8, 1) = "1" Then
+
+            bassPos = t - stepIdx * stepSec
+
+            If bassPos < 0.04 Then
+                v = v + (Rnd - 0.5) * 0.04 * Exp(-bassPos * 90)
+            End If
+
+        End If
+
+        'Low crowd ambience rumble.
+        crowdAvg = crowdAvg * 0.996 + (Rnd * 2 - 1) * 0.004
+        v = v + crowdAvg * musicCrowdAmp * (0.75 + 0.25 * Sin(pi2 * t / 9))
+
+        'Soft limiting.
+        If v > 0.9 Then v = 0.9
+        If v < -0.9 Then v = -0.9
+
+        samples(i) = v
+
+    Next i
+
+    WriteWavFile samples, sampleRate, MusicTrackFile(trackNo)
+
+End Sub
+
+
+Private Sub GenerateSfxFiles()
+
+    'Goal - bright rising fanfare.
+    SfxBegin 0.85
+    SfxTone 0#, 0.15, 523.25, 0.3, 0.35, 5
+    SfxTone 0.1, 0.15, 659.25, 0.3, 0.35, 5
+    SfxTone 0.2, 0.15, 783.99, 0.3, 0.35, 5
+    SfxTone 0.3, 0.5, 1046.5, 0.32, 0.35, 3.5
+    WriteWavFile sfxBuf, sfxRate, audioFolder & "\WCEscape_Goal.wav"
+
+    'Trap - descending warning.
+    SfxBegin 0.7
+    SfxTone 0#, 0.17, 440, 0.3, 0.5, 6
+    SfxTone 0.15, 0.17, 349.23, 0.3, 0.5, 6
+    SfxTone 0.3, 0.36, 261.63, 0.32, 0.5, 4.5
+    WriteWavFile sfxBuf, sfxRate, audioFolder & "\WCEscape_Trap.wav"
+
+    'Wall - low thud.
+    SfxBegin 0.22
+    SfxTone 0#, 0.2, 95, 0.5, 0.2, 16
+    SfxNoise 0#, 0.04, 0.1, 70
+    WriteWavFile sfxBuf, sfxRate, audioFolder & "\WCEscape_Wall.wav"
+
+    'Victory fanfare.
+    SfxBegin 1.55
+    SfxTone 0#, 0.22, 392, 0.28, 0.4, 4
+    SfxTone 0.17, 0.22, 523.25, 0.28, 0.4, 4
+    SfxTone 0.34, 0.22, 659.25, 0.28, 0.4, 4
+    SfxTone 0.51, 0.22, 783.99, 0.28, 0.4, 4
+    SfxTone 0.68, 0.8, 1046.5, 0.32, 0.4, 2.4
+    WriteWavFile sfxBuf, sfxRate, audioFolder & "\WCEscape_Win.wav"
+
+    'Game over - slow descent.
+    SfxBegin 1.75
+    SfxTone 0#, 0.38, 659.25, 0.26, 0.4, 2.5
+    SfxTone 0.35, 0.38, 523.25, 0.26, 0.4, 2.5
+    SfxTone 0.7, 0.38, 440, 0.26, 0.4, 2.5
+    SfxTone 1.05, 0.65, 349.23, 0.28, 0.4, 2
+    WriteWavFile sfxBuf, sfxRate, audioFolder & "\WCEscape_Over.wav"
+
+    'Click.
+    SfxBegin 0.09
+    SfxTone 0#, 0.07, 1250, 0.22, 0.2, 35
+    WriteWavFile sfxBuf, sfxRate, audioFolder & "\WCEscape_Click.wav"
+
+End Sub
+
+
+Private Sub SfxBegin(ByVal durationSec As Double)
+
+    Dim n As Long
+
+    sfxRate = 11025
+
+    n = CLng(durationSec * sfxRate)
+    If n < 2 Then n = 2
+
+    ReDim sfxBuf(0 To n - 1)
+
+End Sub
+
+
+Private Sub SfxTone( _
+    ByVal startSec As Double, _
+    ByVal durSec As Double, _
+    ByVal freq As Double, _
+    ByVal amp As Double, _
+    ByVal harmonic2 As Double, _
+    ByVal decayRate As Double)
+
+    Dim i As Long
+    Dim i0 As Long
+    Dim i1 As Long
+    Dim ph As Double
+    Dim env As Double
+    Dim pi2 As Double
+
+    pi2 = 8 * Atn(1)
+
+    i0 = CLng(startSec * sfxRate)
+    i1 = i0 + CLng(durSec * sfxRate) - 1
+
+    If i0 < 0 Then i0 = 0
+    If i1 > UBound(sfxBuf) Then i1 = UBound(sfxBuf)
+    If i1 < i0 Then Exit Sub
+
+    For i = i0 To i1
+
+        ph = (i - i0) / sfxRate
+
+        env = Exp(-ph * decayRate)
+
+        If ph < 0.006 Then
+            env = env * (ph / 0.006)
+        End If
+
+        sfxBuf(i) = sfxBuf(i) + env * amp * _
+            (Sin(pi2 * freq * ph) + harmonic2 * Sin(pi2 * freq * 2 * ph))
+
+    Next i
+
+End Sub
+
+
+Private Sub SfxNoise( _
+    ByVal startSec As Double, _
+    ByVal durSec As Double, _
+    ByVal amp As Double, _
+    ByVal decayRate As Double)
+
+    Dim i As Long
+    Dim i0 As Long
+    Dim i1 As Long
+    Dim ph As Double
+    Dim env As Double
+
+    i0 = CLng(startSec * sfxRate)
+    i1 = i0 + CLng(durSec * sfxRate) - 1
+
+    If i0 < 0 Then i0 = 0
+    If i1 > UBound(sfxBuf) Then i1 = UBound(sfxBuf)
+    If i1 < i0 Then Exit Sub
+
+    For i = i0 To i1
+
+        ph = (i - i0) / sfxRate
+
+        env = Exp(-ph * decayRate)
+
+        sfxBuf(i) = sfxBuf(i) + (Rnd - 0.5) * 2 * amp * env
+
+    Next i
+
+End Sub
+
+
+Private Sub WriteWavFile( _
+    ByRef samples() As Double, _
+    ByVal sampleRate As Long, _
+    ByVal filePath As String)
+
+    Dim hdr(0 To 43) As Byte
+    Dim wavBytes() As Byte
+    Dim nSamples As Long
+    Dim dataSize As Long
+    Dim riffSize As Long
+    Dim i As Long
+    Dim pcm As Long
+    Dim u As Long
+    Dim fnum As Integer
+
+    nSamples = UBound(samples) + 1
+    dataSize = nSamples * 2
+    riffSize = 36 + dataSize
+
+    'RIFF header (16-bit mono PCM).
+    hdr(0) = 82: hdr(1) = 73: hdr(2) = 70: hdr(3) = 70
+    PutLongInBytes hdr, 4, riffSize
+    hdr(8) = 87: hdr(9) = 65: hdr(10) = 86: hdr(11) = 69
+    hdr(12) = 102: hdr(13) = 109: hdr(14) = 116: hdr(15) = 32
+    PutLongInBytes hdr, 16, 16
+    hdr(20) = 1: hdr(21) = 0
+    hdr(22) = 1: hdr(23) = 0
+    PutLongInBytes hdr, 24, sampleRate
+    PutLongInBytes hdr, 28, sampleRate * 2
+    hdr(32) = 2: hdr(33) = 0
+    hdr(34) = 16: hdr(35) = 0
+    hdr(36) = 100: hdr(37) = 97: hdr(38) = 116: hdr(39) = 97
+    PutLongInBytes hdr, 40, dataSize
+
+    ReDim wavBytes(0 To dataSize - 1)
+
+    For i = 0 To nSamples - 1
+
+        pcm = CLng(samples(i) * 32000)
+
+        If pcm > 32767 Then pcm = 32767
+        If pcm < -32768 Then pcm = -32768
+
+        u = pcm And &HFFFF&
+
+        wavBytes(i * 2) = CByte(u And 255)
+        wavBytes(i * 2 + 1) = CByte(u \ 256)
+
+    Next i
+
+    On Error Resume Next
+
+    Kill filePath
+
+    On Error GoTo 0
+
+    fnum = FreeFile
+
+    Open filePath For Binary Access Write As #fnum
+    Put #fnum, , hdr
+    Put #fnum, , wavBytes
+    Close #fnum
+
+End Sub
+
+
+Private Sub PutLongInBytes(ByRef b() As Byte, ByVal offset As Long, ByVal value As Long)
+
+    b(offset) = value And 255
+    b(offset + 1) = (value \ 256) And 255
+    b(offset + 2) = (value \ 65536) And 255
+    b(offset + 3) = (value \ 16777216) And 255
+
+End Sub
+
+'---------------------------------------------------------
+' SOUND EFFECTS
+'---------------------------------------------------------
+
+Public Sub PlayGoalSound()
+
+    InitAudio
+
+    PlaySfxFile "WCGoal"
+
+End Sub
+
+
+Public Sub PlayTrapSound()
+
+    InitAudio
+
+    PlaySfxFile "WCTrap"
+
+End Sub
+
+
+Public Sub PlayWallSound()
+
+    InitAudio
+
+    PlaySfxFile "WCWall"
+
+End Sub
+
+
+Public Sub PlayVictoryFanfare()
+
+    InitAudio
+
+    PlaySfxFile "WCWin"
+
+End Sub
+
+
+Public Sub PlayGameOverTune()
+
+    InitAudio
+
+    PlaySfxFile "WCOver"
+
+End Sub
+
+
+Public Sub PlayClickSound()
+
+    InitAudio
+
+    PlaySfxFile "WCClick"
+
+End Sub
+
+
+Private Sub CloseSound()
+
+    Dim i As Long
+
+    StopMusic
+
+    On Error Resume Next
+
+    For i = 1 To 3
+        MciExec "close WCMusic" & CStr(i)
+    Next i
+
+    MciExec "close WCGoal"
+    MciExec "close WCTrap"
+    MciExec "close WCWall"
+    MciExec "close WCWin"
+    MciExec "close WCOver"
+    MciExec "close WCClick"
+
+    On Error GoTo 0
+
+    audioReady = False
+
+End Sub
+
+'=========================================================
+' PAUSE
+'=========================================================
+
+Public Sub PauseGame()
+
+    If gameRunning = False Then
+
+        MsgBox "Start the game first.", _
+            vbInformation, _
+            "World Cup Escape"
+
+        Exit Sub
+
+    End If
+
+    If gamePaused = True Then
+
+        MsgBox "The game is already paused.", _
+            vbInformation, _
+            "World Cup Escape"
+
+        Exit Sub
+
+    End If
+
+    pauseStarted = Now
+
+    gamePaused = True
+
+    CancelTimer
+
+    StopMusic
+
+    SetStatus "PAUSED"
+
+End Sub
+
+'=========================================================
+' RESUME
+'=========================================================
+
+Public Sub ResumeGame()
+
+    If gameRunning = False Then
+
+        MsgBox "Start the game first.", _
+            vbInformation, _
+            "World Cup Escape"
+
+        Exit Sub
+
+    End If
+
+    If gamePaused = False Then
+
+        MsgBox "The game is not paused.", _
+            vbInformation, _
+            "World Cup Escape"
+
+        Exit Sub
+
+    End If
+
+    totalPausedSeconds = _
+        totalPausedSeconds + _
+        ((Now - pauseStarted) * 86400)
+
+    gamePaused = False
+
+    StartMusic
+
+    SetStatus "PLAYING"
+
+    UpdateTimer
+
+End Sub
+
+'=========================================================
+' WIN LEVEL
+'=========================================================
+
+Private Sub WinLevel()
+
+    Dim levelTime As Long
+    Dim answer As VbMsgBoxResult
+    Dim msg As String
+
+    levelTime = GetElapsedSeconds()
+
+    gameRunning = False
+
+    CancelTimer
+
+    StopMusic
+
+    ThisWorkbook.Worksheets(SHEET_NAME) _
+        .Range("AB10").value = _
+        FormatGameTime(levelTime)
+
+    PlayVictoryFanfare
+
+    If currentLevel < 5 Then
+
+        SetStatus StageName() & " COMPLETE!"
+
+        msg = StageName() & " complete!" & vbCrLf & vbCrLf
+
+        msg = msg & "Goals collected: " _
+            & goalsCollected & vbCrLf
+
+        msg = msg & "Score: " _
+            & score & vbCrLf
+
+        msg = msg & "Time: " _
+            & FormatGameTime(levelTime) & vbCrLf & vbCrLf
+
+        msg = msg & "Continue to the next stage?"
+
+        answer = MsgBox( _
+            msg, _
+            vbYesNo + vbInformation, _
+            "Stage Complete")
+
+        If answer = vbYes Then
+
+            currentLevel = currentLevel + 1
+
+            BindArrowKeys
+
+            StartLevel
+
+        Else
+
+            UnbindArrowKeys
+
+            CloseSound
+
+        End If
+
+    Else
+
+        SetStatus "WORLD CUP CHAMPION!"
+
+        SaveHighScore _
+            score, _
+            goalsCollected, _
+            levelTime
+
+        msg = "CONGRATULATIONS!" & vbCrLf & vbCrLf
+
+        msg = msg & "You have won the World Cup!" _
+            & vbCrLf & vbCrLf
+
+        msg = msg & "Goals: " _
+            & goalsCollected & vbCrLf
+
+        msg = msg & "Final Score: " _
+            & score & vbCrLf
+
+        msg = msg & "Final Time: " _
+            & FormatGameTime(levelTime) & vbCrLf & vbCrLf
+
+        msg = msg & _
+            "Your result has been added to the High Scores table." _
+            & vbCrLf & vbCrLf
+
+        msg = msg & "Play again?"
+
+        'World Cup trophy celebration before the final message.
+        PlayTrophyAnimation
+
+        answer = MsgBox( _
+            msg, _
+            vbYesNo + vbInformation, _
+            "WORLD CUP CHAMPION")
+
+        If answer = vbYes Then
+
+            UnbindArrowKeys
+
+            StartGame
+
+        Else
+
+            UnbindArrowKeys
+
+            CloseSound
+
+        End If
+
+    End If
+
+End Sub
+
+'=========================================================
+' WORLD CUP TROPHY ANIMATION
+'
+' A short celebration shown on the pitch when the player
+' beats level 5: a golden World Cup style trophy with the
+' recognisable silhouette - the gold globe with continents
+' held aloft, a small figure's head just beneath it, a
+' body that rises narrow from the base, swells to its
+' widest in the lower-middle, then sweeps up into two
+' spiral arms whose tips curl outward and hug the globe's
+' lower sides - all on the malachite base (green band,
+' engraved gold "FIFA WORLD CUP" band, green band).
+' The whole trophy gently pulses while a ring of stars
+' orbits it, followed by the champion message box.
+'=========================================================
+
+Private Sub PlayTrophyAnimation()
+
+    Dim ws As Worksheet
+    Dim bannerShp As Shape
+    Dim stars(0 To 7) As Shape
+    Dim partShp As Shape
+    Dim bodyShp As Shape
+    Dim partNames(0 To 24) As String
+    Dim partL(0 To 24) As Double
+    Dim partT(0 To 24) As Double
+    Dim partW(0 To 24) As Double
+    Dim partH(0 To 24) As Double
+    Dim partCount As Long
+    Dim cx As Double
+    Dim cy As Double
+    Dim tcy As Double
+    Dim i As Long
+    Dim j As Long
+    Dim ang As Double
+    Dim rad As Double
+    Dim pulse As Double
+    Dim animStart As Double
+    Dim pi As Double
+
+    Dim bodyPts As Variant
+    Dim ff As FreeformBuilder
+
+    On Error Resume Next
+
+    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
+
+    pi = Atn(1) * 4
+
+    'Remove any leftover animation shapes first.
+    DeleteTrophyShapes ws
+
+    Application.ScreenUpdating = True
+
+    'Centre of the current maze.
+    cx = ws.Cells(MAZE_TOP + (currentMazeSize \ 2), _
+        MAZE_LEFT + (currentMazeSize \ 2)).Left _
+        + ws.Cells(MAZE_TOP + (currentMazeSize \ 2), _
+        MAZE_LEFT + (currentMazeSize \ 2)).Width / 2
+
+    cy = ws.Cells(MAZE_TOP + (currentMazeSize \ 2), _
+        MAZE_LEFT + (currentMazeSize \ 2)).top _
+        + ws.Cells(MAZE_TOP + (currentMazeSize \ 2), _
+        MAZE_LEFT + (currentMazeSize \ 2)).Height / 2
+
+    tcy = cy - 10
+
+    '-----------------------------------------------------
+    ' MALACHITE BASE - green band, gold engraved band,
+    ' green band (bottom to top of the real trophy base).
+    '-----------------------------------------------------
+
+    'Lower green malachite band (widest).
+    Set partShp = ws.Shapes.AddShape(msoShapeRoundedRectangle, _
+        cx - 48, tcy + 130, 96, 18)
+    partShp.Name = "WCTrophyAnim__BASEBOT"
+    partShp.Fill.ForeColor.RGB = RGB(9, 44, 30)
+    partShp.Line.ForeColor.RGB = RGB(170, 120, 10)
+    partShp.Line.Weight = 1.25
+    AddTrophyPart partNames, partL, partT, partW, partH, partCount, partShp
+
+    'Gold engraved band with the trophy's inscription.
+    Set partShp = ws.Shapes.AddShape(msoShapeRoundedRectangle, _
+        cx - 44, tcy + 112, 88, 18)
+    partShp.Name = "WCTrophyAnim__BAND"
+    partShp.Fill.ForeColor.RGB = RGB(255, 205, 50)
+    partShp.Line.ForeColor.RGB = RGB(170, 120, 10)
+    partShp.Line.Weight = 1
+    AddTrophyPart partNames, partL, partT, partW, partH, partCount, partShp
+
+    With partShp.TextFrame2
+        .WordWrap = msoFalse
+        .MarginLeft = 0
+        .MarginRight = 0
+        .MarginTop = 0
+        .MarginBottom = 0
+        .TextRange.Text = "FIFA WORLD CUP"
+        .TextRange.Font.Size = 7
+        .TextRange.Font.Bold = msoTrue
+        .TextRange.Font.Fill.ForeColor.RGB = RGB(9, 44, 30)
+        .TextRange.ParagraphFormat.Alignment = msoAlignCenter
+        .VerticalAnchor = msoAnchorMiddle
+    End With
+
+    'Upper green malachite band (narrower).
+    Set partShp = ws.Shapes.AddShape(msoShapeRoundedRectangle, _
+        cx - 38, tcy + 96, 76, 16)
+    partShp.Name = "WCTrophyAnim__BASETOP"
+    partShp.Fill.ForeColor.RGB = RGB(12, 58, 40)
+    partShp.Line.ForeColor.RGB = RGB(170, 120, 10)
+    partShp.Line.Weight = 1.25
+    AddTrophyPart partNames, partL, partT, partW, partH, partCount, partShp
+
+    '-----------------------------------------------------
+    ' GOLD BODY - the true World Cup silhouette: narrow at
+    ' the base, swelling to its widest in the lower-middle,
+    ' narrowing again, then flaring up into two spiral arms
+    ' whose tips curl outward and hug the globe.
+    ' (Drawn as a freeform, with a flipped-trapezoid
+    ' fallback for older Excel versions.)
+    '-----------------------------------------------------
+
+    bodyPts = Array( _
+        -22, 96, -30, 76, -44, 48, -52, 18, -50, -8, -45, -28, _
+        -41, -44, -47, -56, -51, -66, -43, -71, -30, -74, _
+        0, -78, _
+        30, -74, 43, -71, 51, -66, 47, -56, 41, -44, 45, -28, _
+        50, -8, 52, 18, 44, 48, 30, 76, 22, 96)
+
+    Set bodyShp = Nothing
+
+    On Error Resume Next
+
+    Set ff = ws.Shapes.BuildFreeform(msoEditingCorner, _
+        cx + bodyPts(0), tcy + bodyPts(1))
+
+    For j = 2 To UBound(bodyPts) Step 2
+
+        ff.AddNodes msoSegmentLine, msoEditingCorner, _
+            cx + bodyPts(j), tcy + bodyPts(j + 1)
+
+    Next j
+
+    Set bodyShp = ff.ConvertToShape
+
+    On Error GoTo 0
+
+    If bodyShp Is Nothing Then
+
+        'Fallback: flipped trapezoid (wide at the top).
+        Set bodyShp = ws.Shapes.AddShape(msoShapeTrapezoid, _
+            cx - 52, tcy - 78, 104, 174)
+        bodyShp.Flip msoFlipVertical
+
+        On Error Resume Next
+        bodyShp.Adjustments.Item(1) = 0.3
+        On Error GoTo 0
+
+    End If
+
+    bodyShp.Name = "WCTrophyAnim__BODY"
+    bodyShp.Fill.ForeColor.RGB = RGB(255, 205, 50)
+    bodyShp.Line.ForeColor.RGB = RGB(170, 120, 10)
+    bodyShp.Line.Weight = 1.25
+    AddTrophyPart partNames, partL, partT, partW, partH, partCount, bodyShp
+
+    'Two interlaced spiral wing streaks crossing the body.
+    Set partShp = ws.Shapes.AddShape(msoShapeOval, _
+        cx - 36, tcy - 36, 16, 88)
+    partShp.Name = "WCTrophyAnim__SPIRALL"
+    partShp.Fill.ForeColor.RGB = RGB(214, 150, 20)
+    partShp.Fill.Transparency = 0.45
+    partShp.Line.Visible = msoFalse
+    partShp.rotation = 12
+    AddTrophyPart partNames, partL, partT, partW, partH, partCount, partShp
+
+    Set partShp = ws.Shapes.AddShape(msoShapeOval, _
+        cx + 20, tcy - 36, 16, 88)
+    partShp.Name = "WCTrophyAnim__SPIRALR"
+    partShp.Fill.ForeColor.RGB = RGB(214, 150, 20)
+    partShp.Fill.Transparency = 0.45
+    partShp.Line.Visible = msoFalse
+    partShp.rotation = -12
+    AddTrophyPart partNames, partL, partT, partW, partH, partCount, partShp
+
+    'Soft highlight on the left of the body.
+    Set partShp = ws.Shapes.AddShape(msoShapeOval, _
+        cx - 29, tcy - 40, 9, 78)
+    partShp.Name = "WCTrophyAnim__BODYHL"
+    partShp.Fill.ForeColor.RGB = RGB(255, 240, 180)
+    partShp.Fill.Transparency = 0.55
+    partShp.Line.Visible = msoFalse
+    partShp.rotation = 10
+    AddTrophyPart partNames, partL, partT, partW, partH, partCount, partShp
+
+    'Soft shading on the right of the body.
+    Set partShp = ws.Shapes.AddShape(msoShapeOval, _
+        cx + 25, tcy - 30, 10, 76)
+    partShp.Name = "WCTrophyAnim__BODYSH"
+    partShp.Fill.ForeColor.RGB = RGB(205, 140, 15)
+    partShp.Fill.Transparency = 0.5
+    partShp.Line.Visible = msoFalse
+    partShp.rotation = -8
+    AddTrophyPart partNames, partL, partT, partW, partH, partCount, partShp
+
+    '-----------------------------------------------------
+    ' THE FIGURE'S HEAD just beneath the globe (its top is
+    ' tucked behind the globe, as on the real trophy).
+    '-----------------------------------------------------
+
+    Set partShp = ws.Shapes.AddShape(msoShapeOval, _
+        cx - 7, tcy - 40, 14, 20)
+    partShp.Name = "WCTrophyAnim__HEAD"
+    partShp.Fill.ForeColor.RGB = RGB(255, 225, 120)
+    partShp.Line.ForeColor.RGB = RGB(170, 120, 10)
+    partShp.Line.Weight = 1
+    AddTrophyPart partNames, partL, partT, partW, partH, partCount, partShp
+
+    '-----------------------------------------------------
+    ' THE GLOBE with continents and a highlight, cradled
+    ' by the spiral arms.
+    '-----------------------------------------------------
+
+    Set partShp = ws.Shapes.AddShape(msoShapeOval, _
+        cx - 46, tcy - 124, 92, 92)
+    partShp.Name = "WCTrophyAnim__GLOBE"
+    partShp.Fill.ForeColor.RGB = RGB(255, 205, 50)
+    partShp.Line.ForeColor.RGB = RGB(170, 120, 10)
+    partShp.Line.Weight = 1.5
+    AddTrophyPart partNames, partL, partT, partW, partH, partCount, partShp
+
+    Set partShp = ws.Shapes.AddShape(msoShapeOval, _
+        cx - 36, tcy - 106, 26, 18)
+    partShp.Name = "WCTrophyAnim__CONT1"
+    partShp.Fill.ForeColor.RGB = RGB(206, 150, 20)
+    partShp.Line.Visible = msoFalse
+    partShp.rotation = -25
+    AddTrophyPart partNames, partL, partT, partW, partH, partCount, partShp
+
+    Set partShp = ws.Shapes.AddShape(msoShapeOval, _
+        cx + 2, tcy - 88, 24, 16)
+    partShp.Name = "WCTrophyAnim__CONT2"
+    partShp.Fill.ForeColor.RGB = RGB(206, 150, 20)
+    partShp.Line.Visible = msoFalse
+    partShp.rotation = 20
+    AddTrophyPart partNames, partL, partT, partW, partH, partCount, partShp
+
+    Set partShp = ws.Shapes.AddShape(msoShapeOval, _
+        cx - 8, tcy - 56, 16, 11)
+    partShp.Name = "WCTrophyAnim__CONT3"
+    partShp.Fill.ForeColor.RGB = RGB(206, 150, 20)
+    partShp.Line.Visible = msoFalse
+    AddTrophyPart partNames, partL, partT, partW, partH, partCount, partShp
+
+    Set partShp = ws.Shapes.AddShape(msoShapeOval, _
+        cx - 34, tcy - 118, 20, 14)
+    partShp.Name = "WCTrophyAnim__GLOBEHL"
+    partShp.Fill.ForeColor.RGB = RGB(255, 255, 255)
+    partShp.Fill.Transparency = 0.55
+    partShp.Line.Visible = msoFalse
+    AddTrophyPart partNames, partL, partT, partW, partH, partCount, partShp
+
+    '-----------------------------------------------------
+    ' Champion banner.
+    '-----------------------------------------------------
+
+    Set bannerShp = ws.Shapes.AddTextbox( _
+        msoTextOrientationHorizontal, _
+        cx - 190, tcy + 168, 380, 36)
+
+    bannerShp.Name = "WCTrophyAnim__BANNER"
+    bannerShp.ZOrder msoBringToFront
+
+    With bannerShp
+        .Fill.ForeColor.RGB = RGB(15, 35, 60)
+        .Line.ForeColor.RGB = RGB(255, 215, 0)
+        .Line.Weight = 1.5
+    End With
+
+    With bannerShp.TextFrame2
+        .TextRange.Text = "WORLD CUP CHAMPION!"
+        .TextRange.Font.Size = 18
+        .TextRange.Font.Bold = msoTrue
+        .TextRange.Font.Fill.ForeColor.RGB = RGB(255, 215, 0)
+        .TextRange.ParagraphFormat.Alignment = msoAlignCenter
+        .VerticalAnchor = msoAnchorMiddle
+    End With
+
+    '-----------------------------------------------------
+    ' Ring of golden stars.
+    '-----------------------------------------------------
+
+    rad = 150
+
+    For i = 0 To 7
+
+        Set stars(i) = ws.Shapes.AddShape( _
+            msoShape5pointStar, cx - 12, cy - 12, 24, 24)
+
+        stars(i).Name = "WCTrophyAnim__STAR" & CStr(i)
+        stars(i).Fill.ForeColor.RGB = RGB(255, 215, 0)
+        stars(i).Line.Visible = msoFalse
+        stars(i).ZOrder msoBringToFront
+
+    Next i
+
+    'Animate for about two seconds.
+    animStart = Timer
+    ang = 0
+
+    Do While Timer - animStart < 2
+
+        ang = ang + 9
+
+        'Trophy gently pulses around its centre.
+        pulse = 1 + (0.07 * Sin(ang * pi / 30))
+
+        For i = 0 To partCount - 1
+
+            Set partShp = ws.Shapes(partNames(i))
+
+            partShp.Width = partW(i) * pulse
+            partShp.Height = partH(i) * pulse
+            partShp.Left = cx + (partL(i) - cx) * pulse
+            partShp.top = tcy + (partT(i) - tcy) * pulse
+
+        Next i
+
+        'Stars orbit the trophy.
+        For i = 0 To 7
+            stars(i).Left = cx + (Cos((ang + i * 45) * pi / 180) * rad) _
+                - (stars(i).Width / 2)
+            stars(i).top = (tcy - 10) + _
+                (Sin((ang + i * 45) * pi / 180) * rad * 0.5) _
+                - (stars(i).Height / 2)
+        Next i
+
+        DoEvents
+
+    Loop
+
+    DeleteTrophyShapes ws
+
+    On Error GoTo 0
+
+End Sub
+
+
+Private Sub AddTrophyPart( _
+    ByRef partNames() As String, _
+    ByRef partL() As Double, _
+    ByRef partT() As Double, _
+    ByRef partW() As Double, _
+    ByRef partH() As Double, _
+    ByRef partCount As Long, _
+    ByVal shp As Shape)
+
+    partNames(partCount) = shp.Name
+    partL(partCount) = shp.Left
+    partT(partCount) = shp.top
+    partW(partCount) = shp.Width
+    partH(partCount) = shp.Height
+    partCount = partCount + 1
+
+End Sub
+
+
+Private Sub DeleteTrophyShapes(ByVal ws As Worksheet)
+
+    Dim shp As Shape
+
+    On Error Resume Next
+
+    For Each shp In ws.Shapes
+
+        If Left$(shp.Name, 14) = "WCTrophyAnim__" Then
+            shp.Delete
+        End If
+
+    Next shp
+
+    On Error GoTo 0
+
+End Sub
+
+'=========================================================
+' GAME OVER
+'=========================================================
+
+Private Sub GameOver()
+
+    Dim levelTime As Long
+    Dim answer As VbMsgBoxResult
+    Dim msg As String
+
+    levelTime = GetElapsedSeconds()
+
+    gameRunning = False
+
+    CancelTimer
+
+    StopMusic
+
+    PlayGameOverTune
+
+    SaveHighScore _
+        score, _
+        goalsCollected, _
+        levelTime, _
+        StageName()
+
+    SetStatus "ELIMINATED"
+
+    msg = "YOU HAVE BEEN ELIMINATED!" & vbCrLf & vbCrLf
+
+    msg = msg & "Tournament Stage: " _
+        & StageName() & vbCrLf
+
+    msg = msg & "Goals: " _
+        & goalsCollected & vbCrLf
+
+    msg = msg & "Score: " _
+        & score & vbCrLf & vbCrLf
+
+    msg = msg & "Would you like another chance?" _
+        & vbCrLf & vbCrLf
+
+    msg = msg & _
+        "Your score and goals from previous completed " _
+        & "levels will be preserved."
+
+    answer = MsgBox( _
+        msg, _
+        vbYesNo + vbExclamation, _
+        "ELIMINATED")
+
+    If answer = vbYes Then
+
+        BindArrowKeys
+
+        RetryGame
+
+    Else
+
+        UnbindArrowKeys
+
+        CloseSound
+
+    End If
+
+End Sub
+
+'=========================================================
+' RETRY CURRENT LEVEL
+'
+' Restores score/goals to the beginning-of-level
+' checkpoint and creates a completely new maze.
+'=========================================================
+
+Private Sub RetryGame()
+
+    Dim oldScreenUpdating As Boolean
+
+    oldScreenUpdating = Application.ScreenUpdating
+
+    '=========================================================
+    ' SPEED OPTIMISATION
+    '
+    ' Use the same loading optimisation as StartLevel.
+    ' This prevents Excel from repainting the worksheet
+    ' while the new maze is being generated and drawn.
+    '=========================================================
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+
+    On Error GoTo RestoreScreenAndRaise
+
+    score = levelStartScore
+
+    goalsCollected = levelStartGoals
+
+    lives = LivesForLevel()
+
+    gameRunning = True
+    gamePaused = False
+
+    'Bring back the chilled music for the new attempt.
+    StartMusic
+
+    currentMazeSize = MazeSizeForLevel()
+
+    If BuildMaze() = False Then
+
+        gameRunning = False
+
+        Application.Calculation = xlCalculationAutomatic
+        Application.EnableEvents = True
+        Application.ScreenUpdating = oldScreenUpdating
+
+        MsgBox _
+            "The new maze could not be created." & vbCrLf & _
+            "Please try again.", _
+            vbCritical, _
+            "World Cup Escape"
+
+        Exit Sub
+
+    End If
+
+    levelStartElapsedSeconds = GetElapsedSeconds()
+
+    playerRow = MAZE_TOP + 1
+    playerCol = MAZE_LEFT + 1
+
+    startRow = playerRow
+    startCol = playerCol
+
+    UpdateDashboard
+
+    'Draw the team flag once per retry (not on every move).
+    RefreshDashboardTeamFlag
+
+    SetStatus "NEW ATTEMPT - GOOD LUCK!"
+
+    UpdateTimer
+
+    'Show the completed new maze only after everything
+    'has finished loading.
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    Application.ScreenUpdating = oldScreenUpdating
+
+    Exit Sub
+
+RestoreScreenAndRaise:
+
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    Application.ScreenUpdating = oldScreenUpdating
+
+    Err.Raise Err.Number, Err.Source, Err.Description
+
+End Sub
+
+'=========================================================
+' RESTART CURRENT LEVEL MANUALLY
+'=========================================================
+
+Public Sub RestartCurrentLevel()
+
+    If currentLevel < 1 Then
+
+        StartGame
+
+        Exit Sub
+
+    End If
+
+    RetryGame
+
+End Sub
+
+'=========================================================
+' INSTRUCTIONS
+'=========================================================
+
+Public Sub ShowInstructions()
+
+    Dim msg As String
+
+    msg = "WORLD CUP ESCAPE" & vbCrLf & vbCrLf
+
+    msg = msg & "OBJECTIVE:" & vbCrLf
+
+    msg = msg & _
+        "Play your way through the tournament " & _
+        "and reach the World Cup Trophy." _
+        & vbCrLf & vbCrLf
+
+    msg = msg & "CONTROLS:" & vbCrLf
+
+    msg = msg & _
+        "Use the arrow keys to control your player." _
+        & vbCrLf & vbCrLf
+
+    msg = msg & _
+        "Press M to switch the stadium music on or off." _
+        & vbCrLf & vbCrLf
+
+    msg = msg & "GAME SYMBOLS:" & vbCrLf
+
+    msg = msg & "Blue Player Icon = Player" & vbCrLf
+    msg = msg & "Shield = Defender" & vbCrLf
+    msg = msg & "Golden Football = Goal" & vbCrLf
+    msg = msg & "Trophy = World Cup / Exit" & vbCrLf
+    msg = msg & "Warning = Trap" & vbCrLf & vbCrLf
+
+    msg = msg & "RULES:" & vbCrLf
+
+    msg = msg & _
+        "- You have 90 seconds to complete each stage of the tournament." _
+        & vbCrLf
+
+    msg = msg & _
+        "- Hitting a defender removes one life." _
+        & vbCrLf
+
+    msg = msg & _
+        "- Hitting a trap removes one life." _
+        & vbCrLf
+
+    msg = msg & _
+        "- Collect goals to increase your score." _
+        & vbCrLf
+
+    msg = msg & _
+        "- Multiple routes exist through the maze." _
+        & vbCrLf
+
+    msg = msg & _
+        "- Some routes contain hidden traps." _
+        & vbCrLf
+
+    msg = msg & _
+        "- At least one safe route exists." _
+        & vbCrLf
+
+    msg = msg & _
+        "- Complete all five stages to win." _
+        & vbCrLf & vbCrLf
+
+    msg = msg & "TOURNAMENT:" & vbCrLf
+
+    msg = msg & "1. Group Stage" & vbCrLf
+
+    msg = msg & "2. Round of 16" & vbCrLf
+
+    msg = msg & "3. Quarter-Final" & vbCrLf
+
+    msg = msg & "4. Semi-Final" & vbCrLf
+
+    msg = msg & "5. World Cup Final" & vbCrLf & vbCrLf
+
+    msg = msg & "Good luck, Champion!"
+
+    MsgBox msg, _
+        vbInformation, _
+        "HOW TO PLAY"
+
+End Sub
+
+'=========================================================
+' STOP GAME
+'=========================================================
+
+Public Sub StopGame()
+
+    CancelTimer
+
+    StopMusic
+
+    CloseSound
+
+    gameRunning = False
+    gamePaused = False
+
+    UnbindArrowKeys
+
+    SetStatus "GAME STOPPED"
+
+End Sub
+
+'=========================================================
+' TIMER PROCEDURE NAME
+'=========================================================
+
+Private Function TimerProcedureName() As String
+
+    TimerProcedureName = _
+        "'" & Replace( _
+        ThisWorkbook.Name, _
+        "'", _
+        "''") & "'!UpdateTimer"
+
+End Function
+
+'=========================================================
+' CANCEL TIMER
+'=========================================================
+
+Private Sub CancelTimer()
+
+    On Error Resume Next
+
+    If nextTickScheduled = True Then
+
+        Application.OnTime _
+            EarliestTime:=nextTick, _
+            Procedure:=TimerProcedureName(), _
+            Schedule:=False
+
+    End If
+
+    nextTickScheduled = False
+
+    nextTick = 0
+
+    On Error GoTo 0
+
+End Sub
+
+'=========================================================
+' HIGH SCORE TABLE
+'
+' AD = Rank
+' AE = Score
+' AF = Goals
+' AG = Time
+' AH = Result
+'=========================================================
+
+Private Sub SetupHighScores()
+
+    Dim ws As Worksheet
+    Dim r As Long
+
+    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
+
+    '=========================================================
+    ' REMOVE OLD MERGE
+    '=========================================================
+
+    On Error Resume Next
+
+    ws.Range("AD1:AI1").UnMerge
+
+    On Error GoTo 0
+
+    '=========================================================
+    ' CLEAR ONLY HEADER AREA
+    '
+    ' Existing high scores are preserved.
+    '=========================================================
+
+    ws.Range("AD1:AI2").ClearContents
+
+    '=========================================================
+    ' HIGH SCORE TITLE
+    '=========================================================
+
+    With ws.Range("AD1:AI1")
+
+        .Merge
+
+        .value = "HIGH SCORES"
+
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+
+        .Font.Bold = True
+        .Font.Size = 20
+
+        .Font.Color = RGB(255, 215, 0)
+
+        .Interior.Color = RGB(15, 35, 60)
+
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(255, 215, 0)
+        .Borders.Weight = xlMedium
+
+    End With
+
+    '=========================================================
+    ' HIGH SCORE HEADERS
+    '=========================================================
+
+    ws.Range("AD2").value = "RANK"
+    ws.Range("AE2").value = "SCORE"
+    ws.Range("AF2").value = "GOALS"
+    ws.Range("AG2").value = "TIME"
+    ws.Range("AH2").value = "RESULT"
+    ws.Range("AI2").value = "TEAM"
+
+    With ws.Range("AD2:AI2")
+
+        .Font.Bold = True
+        .Font.Size = 12
+
+        .Font.Color = RGB(255, 255, 255)
+
+        .Interior.Color = RGB(35, 75, 55)
+
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(180, 190, 200)
+
+    End With
+
+    '=========================================================
+    ' RANK NUMBERS
+    '=========================================================
+
+    For r = 3 To 12
+
+        ws.Cells(r, 30).value = r - 2
+
+    Next r
+
+    '=========================================================
+    ' HIGH SCORE TABLE
+    '=========================================================
+
+    With ws.Range("AD3:AI12")
+
+        .Font.Bold = True
+        .Font.Size = 12
+
+        .Font.Color = RGB(15, 35, 60)
+
+        .Interior.Color = RGB(248, 250, 252)
+
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(200, 205, 210)
+
+    End With
+
+    With ws.Range("AI3:AI12")
+
+        .Font.Name = "Segoe UI Emoji"
+        .Font.Size = 12
+        .HorizontalAlignment = xlLeft
+        .VerticalAlignment = xlCenter
+
+        'Wrapping off so long team names with the flag
+        'indent never wrap underneath the flag graphic.
+        .WrapText = False
+
+    End With
+
+    '=========================================================
+    ' TIME FORMAT
+    '=========================================================
+
+    ws.Range("AG3:AG12").NumberFormat = "[m]:ss"
+
+    '=========================================================
+    ' COLUMN WIDTHS
+    '=========================================================
+
+    ws.Columns("AD").ColumnWidth = 10
+    ws.Columns("AE").ColumnWidth = 15
+    ws.Columns("AF").ColumnWidth = 13
+    ws.Columns("AG").ColumnWidth = 15
+    ws.Columns("AH").ColumnWidth = 30
+    ws.Columns("AI").ColumnWidth = 28
+
+    '=========================================================
+    ' ROW HEIGHTS
+    '=========================================================
+
+    ws.Rows("1:2").RowHeight = 36
+
+    For r = 3 To 12
+
+        ws.Rows(r).RowHeight = 30
+
+    Next r
+
+    '=========================================================
+    ' TOP THREE HIGHLIGHT
+    '=========================================================
+
+    ws.Range("AD3:AI3").Interior.Color = RGB(255, 235, 150)
+
+    ws.Range("AD4:AI4").Interior.Color = RGB(225, 230, 235)
+
+    ws.Range("AD5:AI5").Interior.Color = RGB(235, 215, 190)
+
+    RefreshHighScoreFlags
+
+End Sub
+
+
+Private Sub DeleteDashboardFlagShapes(ByVal ws As Worksheet)
+
+    Dim shp As Shape
+
+    On Error Resume Next
+
+    For Each shp In ws.Shapes
+
+        If Left$(shp.Name, 17) = "WCDashboardFlag__" Then
+            shp.Delete
+        End If
+
+    Next shp
+
+    On Error GoTo 0
+
+End Sub
+
+
+Private Sub DeleteHighScoreFlagShapes(ByVal ws As Worksheet)
+
+    Dim shp As Shape
+
+    On Error Resume Next
+
+    For Each shp In ws.Shapes
+
+        If Left$(shp.Name, 17) = "WCHighScoreFlag__" Then
+            shp.Delete
+        End If
+
+    Next shp
+
+    On Error GoTo 0
+
+End Sub
+
+
+Private Sub RefreshDashboardTeamFlag()
+
+    Dim ws As Worksheet
+    Dim teamIndex As Long
+    Dim target As Range
+
+    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
+
+    DeleteDashboardFlagShapes ws
+
+    If selectedTeam = "" Then Exit Sub
+
+    teamIndex = TeamIndexFromName(selectedTeam)
+
+    If teamIndex < 0 Then Exit Sub
+
+    Set target = ws.Range("AB2")
+
+    DrawTeamFlagGraphic _
+        ws, _
+        teamIndex, _
+        target.Left + 4, _
+        target.top + 4, _
+        24, _
+        16, _
+        "WCDashboardFlag"
+
+End Sub
+
+
+Private Sub RefreshHighScoreFlags()
+
+    Dim ws As Worksheet
+    Dim r As Long
+    Dim teamName As String
+    Dim teamIndex As Long
+    Dim target As Range
+
+    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
+
+    DeleteHighScoreFlagShapes ws
+
+    On Error Resume Next
+
+    For Each target In ws.Range("AI3:AI12")
+
+        teamName = CStr(target.value)
+
+        If teamName <> "" Then
+
+            teamName = ExtractTeamName(teamName)
+
+            If teamName <> "" Then
+
+                'Extra indent spaces keep the team name clear
+                'of the flag graphic drawn on top of this cell.
+                target.value = "           " & teamName
+
+                teamIndex = TeamIndexFromName(teamName)
+
+                If teamIndex >= 0 Then
+
+                    DrawTeamFlagGraphic _
+                        ws, _
+                        teamIndex, _
+                        target.Left + 4, _
+                        target.top + 7, _
+                        24, _
+                        16, _
+                        "WCHighScoreFlag__" & CStr(target.Row)
+
+                End If
+
+            End If
+
+        End If
+
+    Next target
+
+    On Error GoTo 0
+
+End Sub
+
+
+Private Function ExtractTeamName(ByVal displayText As String) As String
+
+    Dim teams As Variant
+    Dim i As Long
+
+    teams = Array( _
+        "Algeria", "Argentina", "Australia", "Austria", _
+        "Belgium", "Bosnia and Herzegovina", "Brazil", "Cabo Verde", _
+        "Canada", "Colombia", "Congo DR", "Croatia", _
+        "Curaçao", "Czechia", "Ecuador", "Egypt", _
+        "England", "France", "Germany", "Ghana", _
+        "Haiti", "IR Iran", "Iraq", "Japan", _
+        "Jordan", "Korea Republic", "Mexico", "Morocco", _
+        "Netherlands", "New Zealand", "Norway", "Panama", _
+        "Paraguay", "Portugal", "Qatar", "Saudi Arabia", _
+        "Scotland", "Senegal", "South Africa", "Spain", _
+        "Sweden", "Switzerland", "Tunisia", "Türkiye", _
+        "USA", "Uruguay", "Uzbekistan", "Côte d'Ivoire")
+
+    For i = LBound(teams) To UBound(teams)
+
+        If InStr(1, displayText, teams(i), vbTextCompare) > 0 Then
+
+            ExtractTeamName = teams(i)
+            Exit Function
+
+        End If
+
+    Next i
+
+    ExtractTeamName = ""
+
+End Function
+
+
+Private Function TeamIndexFromName(ByVal teamName As String) As Long
+
+    Dim teams As Variant
+    Dim i As Long
+
+    teams = Array( _
+        "Algeria", "Argentina", "Australia", "Austria", _
+        "Belgium", "Bosnia and Herzegovina", "Brazil", "Cabo Verde", _
+        "Canada", "Colombia", "Congo DR", "Croatia", _
+        "Curaçao", "Czechia", "Ecuador", "Egypt", _
+        "England", "France", "Germany", "Ghana", _
+        "Haiti", "IR Iran", "Iraq", "Japan", _
+        "Jordan", "Korea Republic", "Mexico", "Morocco", _
+        "Netherlands", "New Zealand", "Norway", "Panama", _
+        "Paraguay", "Portugal", "Qatar", "Saudi Arabia", _
+        "Scotland", "Senegal", "South Africa", "Spain", _
+        "Sweden", "Switzerland", "Tunisia", "Türkiye", _
+        "USA", "Uruguay", "Uzbekistan", "Côte d'Ivoire")
+
+    For i = LBound(teams) To UBound(teams)
+
+        If StrComp(teams(i), teamName, vbTextCompare) = 0 Then
+
+            TeamIndexFromName = i
+            Exit Function
+
+        End If
+
+    Next i
+
+    TeamIndexFromName = -1
+
+End Function
+
+'=========================================================
+' SAVE HIGH SCORE
+'
+' Ranking order:
+'   1. Result (World Cup Champion is best,
+'      then Semi-Final, Quarter-Final, Round of 16,
+'      Group Stage)
+'   2. Score (higher first)
+'   3. Goals (more first)
+'   4. Time (faster first, final tie-break)
+'=========================================================
+
+Private Sub SaveHighScore( _
+    ByVal finalScore As Long, _
+    ByVal finalGoals As Long, _
+    ByVal finalTime As Long, _
+    Optional ByVal finalResult As String = "")
+
+    Dim ws As Worksheet
+
+    Dim r As Long
+    Dim insertRow As Long
+
+    Dim existingScore As Long
+    Dim existingGoals As Long
+    Dim existingTime As Long
+    Dim existingResult As String
+
+    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
+
+    insertRow = 13
+
+    If finalResult = "" Then
+        finalResult = "WORLD CUP CHAMPION"
+    End If
+
+    '=========================================================
+    ' FIND INSERT POSITION
+    '=========================================================
+
+    For r = 3 To 12
+
+        'Empty position
+        If ws.Cells(r, 31).value = "" Then
+
+            insertRow = r
+
+            Exit For
+
+        End If
+
+        existingScore = _
+            Val(ws.Cells(r, 31).value)
+
+        existingGoals = _
+            Val(ws.Cells(r, 32).value)
+
+        existingResult = _
+            CStr(ws.Cells(r, 34).value)
+
+        If ws.Cells(r, 33).value <> "" Then
+
+            existingTime = _
+                CLng(ws.Cells(r, 33).value * 86400)
+
+        Else
+
+            existingTime = 999999
+
+        End If
+
+        '1. Better result goes first
+        If ResultRank(finalResult) > ResultRank(existingResult) Then
+
+            insertRow = r
+
+            Exit For
+
+        End If
+
+        If ResultRank(finalResult) = ResultRank(existingResult) Then
+
+            '2. Same result: higher score goes first
+            If finalScore > existingScore Then
+
+                insertRow = r
+
+                Exit For
+
+            End If
+
+            '3. Same score: more goals go first
+            If finalScore = existingScore Then
+
+                If finalGoals > existingGoals Then
+
+                    insertRow = r
+
+                    Exit For
+
+                End If
+
+                '4. Same goals: faster time goes first
+                If finalGoals = existingGoals Then
+
+                    If finalTime < existingTime Then
+
+                        insertRow = r
+
+                        Exit For
+
+                    End If
+
+                End If
+
+            End If
+
+        End If
+
+    Next r
+
+    'Not good enough for top 10
+    If insertRow > 12 Then Exit Sub
+
+    '=========================================================
+    ' MOVE OLD SCORES DOWN
+    '=========================================================
+
+    For r = 12 To insertRow + 1 Step -1
+
+        ws.Cells(r, 31).value = _
+            ws.Cells(r - 1, 31).value
+
+        ws.Cells(r, 32).value = _
+            ws.Cells(r - 1, 32).value
+
+        ws.Cells(r, 33).value = _
+            ws.Cells(r - 1, 33).value
+
+        ws.Cells(r, 34).value = _
+            ws.Cells(r - 1, 34).value
+
+        ws.Cells(r, 35).value = _
+            ws.Cells(r - 1, 35).value
+
+    Next r
+
+    '=========================================================
+    ' INSERT NEW SCORE
+    '=========================================================
+
+    ws.Cells(insertRow, 31).value = finalScore
+
+    ws.Cells(insertRow, 32).value = finalGoals
+
+    ws.Cells(insertRow, 33).value = _
+        finalTime / 86400
+
+    ws.Cells(insertRow, 34).value = _
+        finalResult
+
+    ws.Cells(insertRow, 35).value = _
+        "           " & selectedTeam
+
+    ws.Cells(insertRow, 33).NumberFormat = "[m]:ss"
+
+    RefreshHighScoreFlags
+
+    '=========================================================
+    ' UPDATE RANKS
+    '=========================================================
+
+    For r = 3 To 12
+
+        ws.Cells(r, 30).value = r - 2
+
+    Next r
+
+End Sub
+
+'=========================================================
+' RESULT RANK
+'
+' Converts a result string into a ranking tier so the
+' high score table can order entries by result first.
+'=========================================================
+
+Private Function ResultRank(ByVal resultText As String) As Long
+
+    Select Case UCase$(Trim$(resultText))
+
+        Case "WORLD CUP CHAMPION"
+            ResultRank = 5
+
+        Case "SEMI-FINAL", "SEMI FINAL", "WORLD CUP FINAL"
+            ResultRank = 4
+
+        Case "QUARTER-FINAL", "QUARTER FINAL"
+            ResultRank = 3
+
+        Case "ROUND OF 16"
+            ResultRank = 2
+
+        Case "GROUP STAGE"
+            ResultRank = 1
+
+        Case Else
+            ResultRank = 0
+
+    End Select
+
+End Function
+
+'=========================================================
+' CLEAR HIGH SCORES
+'=========================================================
+
+Public Sub ClearHighScores()
+
+    Dim answer As VbMsgBoxResult
+
+    answer = MsgBox( _
+        "Are you sure you want to clear the High Scores table?", _
+        vbYesNo + vbQuestion, _
+        "Clear High Scores")
+
+    If answer = vbNo Then Exit Sub
+
+    ThisWorkbook.Worksheets(SHEET_NAME) _
+        .Range("AD3:AI12").ClearContents
+
+    SetupHighScores
+
+    MsgBox _
+        "High Scores have been cleared.", _
+        vbInformation, _
+        "World Cup Escape"
+
+End Sub
+
