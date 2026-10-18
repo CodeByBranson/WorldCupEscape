@@ -75,6 +75,9 @@ If you encounter a problem, please provide:
 
 Screenshots are welcome, but please remove any personal or sensitive information before sharing them.
 
+## Credits
+
+See Assets_and_Credits.md for information about the game's assets and acknowledgements.
 
 ## Licence
 
