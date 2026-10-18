@@ -51,7 +51,7 @@ This version runs inside Excel and is not currently a standalone Windows applica
 - `GameFiles/` — the game workbook.
 - `SourceCode/` — VBA source code.
 - `Screenshots/` — screenshots of the game.
-- `Documentation/` — Readme, player instructions, and testing notes.
+- `Documentation/` — Readme, player instructions, testing notes and assets & credits.
 
 ## Current Project Status
 
